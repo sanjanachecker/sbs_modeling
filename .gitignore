@@ -1,0 +1,12 @@
+# Ignore virtual environment
+.venv/
+venv/
+
+# Ignore CSV data files
+*.csv
+
+# (optional) ignore Jupyter checkpoints if you use notebooks
+.ipynb_checkpoints/
+
+# (optional) ignore macOS metadata files
+.DS_Store
