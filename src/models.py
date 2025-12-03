@@ -376,7 +376,7 @@ class Trainer:
             criterion = nn.CrossEntropyLoss()
         
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5, verbose=True
+            optimizer, mode='max', factor=0.5, patience=5
         )
         
         best_val_acc = 0
@@ -401,7 +401,7 @@ class Trainer:
                 best_val_acc = val_acc
                 patience_counter = 0
                 # Save best model
-                torch.save(self.model.state_dict(), 'best_model.pth')
+                torch.save(self.model.state_dict(), 'models/best_model.pth')
             else:
                 patience_counter += 1
             
@@ -416,7 +416,7 @@ class Trainer:
                 break
         
         # Load best model
-        self.model.load_state_dict(torch.load('best_model.pth'))
+        self.model.load_state_dict(torch.load('models/best_model.pth'))
         print(f"\nTraining complete. Best validation accuracy: {best_val_acc:.2f}%")
     
     def predict(self, dataloader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
@@ -472,7 +472,7 @@ def compute_class_weights(y: np.ndarray) -> torch.Tensor:
     return torch.FloatTensor(weights)
 
 
-def plot_training_history(history: Dict, save_path: str = 'training_history.png'):
+def plot_training_history(history: Dict, save_path: str = 'eval/training_history.png'):
     """Plot training curves"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
@@ -500,7 +500,7 @@ def plot_training_history(history: Dict, save_path: str = 'training_history.png'
 
 
 def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], 
-                         save_path: str = 'confusion_matrix.png'):
+                         save_path: str = 'eval/confusion_matrix.png'):
     """Plot confusion matrix"""
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -537,7 +537,8 @@ def main():
     
     # Configuration
     CONFIG = {
-        'csv_path': '/mnt/user-data/uploads/all_fires_complete_covariates.csv',
+        'csv_path': '../data/all_fires_complete_covariates.csv
+',
         'model_type': 'mlp',  # Options: 'mlp', 'resnet', 'attention'
         'feature_groups': ['spectral', 'indices', 'diff_indices', 'terrain', 'climate'],
         'batch_size': 64,
@@ -629,10 +630,10 @@ def main():
           f"Macro F1: {results['macro_f1']:.3f} | Weighted F1: {results['weighted_f1']:.3f}")
     
     # Save outputs
-    plot_training_history(trainer.history, 'training_history.png')
+    plot_training_history(trainer.history, 'eval/training_history.png')
     plot_confusion_matrix(results['confusion_matrix'], 
                          data_loader.label_encoder.classes_,
-                         'confusion_matrix.png')
+                         'eval/confusion_matrix.png')
     save_results(results, data_loader.label_encoder, 'results.json')
     
     print(f"\n{'='*60}")

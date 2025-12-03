@@ -42,7 +42,7 @@ if __name__ == '__main__':
     print("="*70 + "\n")
     
     # Load data
-    data_loader = WildfireDataLoader('/mnt/user-data/uploads/all_fires_complete_covariates.csv')
+    data_loader = WildfireDataLoader('./all_fires_complete_covariates.csv')
     data_loader.load_and_clean(drop_missing=True)
     
     # Prepare features
