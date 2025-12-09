@@ -48,8 +48,8 @@ class Config:
     """Central configuration"""
     
     # File paths
-    COMPLETE_DATA_PATH = 'data/all_fires_complete_covariates.csv'
-    UPSAMPLED_DATA_PATH = 'data/all_fires_upsampled_points_with_covariates.csv'
+    COMPLETE_DATA_PATH = 'data/all_fires_complete_covariates_fixed_129.csv'
+    UPSAMPLED_DATA_PATH = 'data/all_fires_upsampled_points_with_covariates_fixed_v2.csv'
     OUTPUT_DIR = Path('results_high_severity_focused')
     
     # Top features

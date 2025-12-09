@@ -537,8 +537,7 @@ def main():
     
     # Configuration
     CONFIG = {
-        'csv_path': '../data/all_fires_complete_covariates.csv
-',
+        'csv_path': '../data/all_fires_complete_covariates_fixed.csv',
         'model_type': 'mlp',  # Options: 'mlp', 'resnet', 'attention'
         'feature_groups': ['spectral', 'indices', 'diff_indices', 'terrain', 'climate'],
         'batch_size': 64,

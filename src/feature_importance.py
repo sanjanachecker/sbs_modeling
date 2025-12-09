@@ -33,7 +33,7 @@ print("FEATURE IMPORTANCE ANALYSIS FOR WILDFIRE BURN SEVERITY")
 print("="*80)
 
 # Load data
-df = pd.read_csv('data/all_fires_complete_covariates.csv')
+df = pd.read_csv('data/all_fires_complete_covariates_fixed_129.csv')
 print(f"\nDataset shape: {df.shape}")
 print(f"Total samples: {len(df)}")
 
