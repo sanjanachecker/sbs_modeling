@@ -149,7 +149,7 @@ def train_random_forest(X_train, y_train, class_weight='balanced'):
     """Train a Random Forest classifier."""
     rf = RandomForestClassifier(
         n_estimators=300,
-        max_depth=20,
+        max_depth=15,
         min_samples_split=5,
         min_samples_leaf=2,
         class_weight=class_weight,

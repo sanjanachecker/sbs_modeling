@@ -1,0 +1,11 @@
+params,mean_test_score,std_test_score,mean_train_score,train_cv_gap,rank_test_score
+"{'class_weight': 'balanced', 'max_depth': 15, 'max_features': 'sqrt', 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 300}",0.5725788624728373,0.018627060239738587,0.9841230553483756,0.41154419287553834,1
+"{'class_weight': 'balanced', 'max_depth': 20, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 10, 'n_estimators': 300}",0.5713533530362392,0.006694949508430216,0.9499288431666779,0.3785754901304387,2
+"{'class_weight': 'balanced', 'max_depth': 15, 'max_features': 'sqrt', 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 200}",0.5711242244957002,0.018293881931587597,0.9833012673468948,0.4121770428511946,3
+"{'class_weight': 'balanced', 'max_depth': 15, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 200}",0.5710590398825763,0.013114056656864489,0.9854930398011442,0.4144339999185679,4
+"{'class_weight': 'balanced', 'max_depth': 15, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 300}",0.5709499183717375,0.015052765762556439,0.9867250533954806,0.4157751350237431,5
+"{'class_weight': 'balanced', 'max_depth': 10, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 300}",0.570755052559386,0.01708006790235879,0.9342738975041609,0.36351884494477493,6
+"{'class_weight': 'balanced', 'max_depth': 20, 'max_features': 'sqrt', 'min_samples_leaf': 4, 'min_samples_split': 10, 'n_estimators': 200}",0.5706977942225452,0.01629211142565204,0.8927432038381402,0.322045409615595,7
+"{'class_weight': 'balanced', 'max_depth': 10, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 5, 'n_estimators': 200}",0.5705611705241662,0.01427718986746202,0.9324941589274207,0.3619329884032545,8
+"{'class_weight': 'balanced', 'max_depth': 20, 'max_features': 'sqrt', 'min_samples_leaf': 4, 'min_samples_split': 10, 'n_estimators': 300}",0.5699703351235359,0.014442260979583647,0.8951976145538663,0.32522727943033036,9
+"{'class_weight': 'balanced', 'max_depth': 15, 'max_features': 0.5, 'min_samples_leaf': 2, 'min_samples_split': 10, 'n_estimators': 300}",0.5699340397870991,0.016045406982957013,0.9480331205255073,0.37809908073840814,10
