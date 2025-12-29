@@ -1,11 +1,10 @@
 """
-Wildfire Burn Severity Model Training - No Upsampling
-======================================================
+Wildfire Burn Severity Model Training - WITH Upsampling
+========================================================
 Uses top 30 features from feature importance analysis
-Trains on original data only (no upsampled unburned points)
+Combines original data WITH upsampled unburned points
 Generates evaluation visualizations and saves model
 
-Author: Generated for SBS Thesis Project
 Date: December 2024
 """
 
@@ -32,12 +31,15 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # ============================================================================
 
-DATA_PATH = 'data/all_fires_complete_covariates_fixed_129.csv'
+# Data paths
+ORIGINAL_DATA_PATH = 'data/all_fires_complete_covariates_fixed_129.csv'
+UPSAMPLED_DATA_PATH = 'data/all_fires_upsampled_points_with_covariates_fixed_129.csv'
+
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
 # Output directories
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else '/home/claude'
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 
@@ -58,19 +60,84 @@ TOP_30_FEATURES = [
 # LOAD AND PREPARE DATA
 # ============================================================================
 
-def load_data(filepath):
-    """Load and prepare the dataset."""
+def load_original_data(filepath):
+    """Load and prepare the original dataset."""
     df = pd.read_csv(filepath)
     df['SBS'] = df['SBS'].replace({'mod': 'moderate'})
     return df
 
 
+def load_upsampled_data(filepath):
+    """Load the upsampled unburned points."""
+    df = pd.read_csv(filepath)
+    # All points in this file are unburned (SBS='unburned')
+    return df
+
+
+def combine_datasets(df_original, df_upsampled, include_upsampling=True):
+    """
+    Combine original data with upsampled unburned points.
+    
+    Strategy: 
+    - Keep all original data (including original unburned points)
+    - Add upsampled unburned points to balance classes
+    
+    Parameters:
+    -----------
+    df_original : DataFrame
+        Original dataset with all severity classes
+    df_upsampled : DataFrame
+        Upsampled unburned points
+    include_upsampling : bool
+        If True, include upsampled data. If False, return only original.
+    
+    Returns:
+    --------
+    DataFrame : Combined dataset
+    """
+    if not include_upsampling:
+        return df_original.copy()
+    
+    # Find common columns (excluding coordinate columns that differ)
+    orig_cols = set(df_original.columns)
+    ups_cols = set(df_upsampled.columns)
+    
+    # Columns to exclude from comparison (they differ between datasets)
+    exclude_cols = {'PointX', 'PointY', 'Source', 'source', '.geo', 'system:index'}
+    
+    # Get common feature columns
+    common_cols = (orig_cols & ups_cols) - exclude_cols
+    
+    # Add SBS and Fire_year which we need
+    required_cols = ['SBS', 'Fire_year'] + [c for c in common_cols if c not in ['SBS', 'Fire_year']]
+    required_cols = [c for c in required_cols if c in df_original.columns and c in df_upsampled.columns]
+    
+    # Select only common columns from both datasets
+    df_orig_subset = df_original[required_cols].copy()
+    df_ups_subset = df_upsampled[required_cols].copy()
+    
+    # Add a flag to track data source
+    df_orig_subset['data_source'] = 'original'
+    df_ups_subset['data_source'] = 'upsampled'
+    
+    # Combine
+    df_combined = pd.concat([df_orig_subset, df_ups_subset], ignore_index=True)
+    
+    return df_combined
+
+
 def prepare_features(df, feature_list):
     """Prepare feature matrix and target vector."""
     available_features = [f for f in feature_list if f in df.columns]
+    missing_features = [f for f in feature_list if f not in df.columns]
+    
+    if missing_features:
+        print(f"    Warning: Missing features: {missing_features[:5]}...")  # Show first 5
+    
     df_clean = df.dropna(subset=['SBS'])
     X = df_clean[available_features].fillna(df_clean[available_features].median())
     y = df_clean['SBS']
+    
     return X, y, available_features
 
 
@@ -134,16 +201,11 @@ def cross_validate(model, X, y, cv=5):
 def plot_confusion_matrix(cm, classes, save_path):
     """Plot and save confusion matrix heatmap."""
     plt.figure(figsize=(10, 8))
-    
-    # Normalize confusion matrix
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    
-    # Create heatmap
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=classes, yticklabels=classes,
                 cbar_kws={'label': 'Count'})
-    
-    plt.title('Confusion Matrix\nWildfire Burn Severity Classification', fontsize=14, fontweight='bold')
+    plt.title('Confusion Matrix\nWildfire Burn Severity Classification (With Upsampling)', 
+              fontsize=14, fontweight='bold')
     plt.xlabel('Predicted Label', fontsize=12)
     plt.ylabel('True Label', fontsize=12)
     plt.tight_layout()
@@ -155,13 +217,10 @@ def plot_confusion_matrix(cm, classes, save_path):
 def plot_normalized_confusion_matrix(cm, classes, save_path):
     """Plot and save normalized confusion matrix."""
     plt.figure(figsize=(10, 8))
-    
     cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    
     sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues',
                 xticklabels=classes, yticklabels=classes,
                 cbar_kws={'label': 'Percentage'})
-    
     plt.title('Normalized Confusion Matrix\n(Row-wise Percentages)', fontsize=14, fontweight='bold')
     plt.xlabel('Predicted Label', fontsize=12)
     plt.ylabel('True Label', fontsize=12)
@@ -180,11 +239,11 @@ def plot_feature_importance(model, features, save_path, top_n=20):
     
     plt.figure(figsize=(10, 8))
     colors = plt.cm.Blues(np.linspace(0.4, 0.8, len(importance_df)))
-    
     plt.barh(importance_df['feature'], importance_df['importance'], color=colors)
     plt.xlabel('Feature Importance (MDI)', fontsize=12)
     plt.ylabel('Feature', fontsize=12)
-    plt.title(f'Top {top_n} Feature Importances\nRandom Forest Model', fontsize=14, fontweight='bold')
+    plt.title(f'Top {top_n} Feature Importances\nRandom Forest Model (With Upsampling)', 
+              fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -197,21 +256,20 @@ def plot_class_performance(results, classes, save_path):
     width = 0.25
     
     fig, ax = plt.subplots(figsize=(12, 6))
-    
     bars1 = ax.bar(x - width, results['precision'], width, label='Precision', color='#2ecc71')
     bars2 = ax.bar(x, results['recall'], width, label='Recall', color='#3498db')
     bars3 = ax.bar(x + width, results['f1'], width, label='F1-Score', color='#9b59b6')
     
     ax.set_xlabel('Burn Severity Class', fontsize=12)
     ax.set_ylabel('Score', fontsize=12)
-    ax.set_title('Model Performance by Class\nPrecision, Recall, and F1-Score', fontsize=14, fontweight='bold')
+    ax.set_title('Model Performance by Class\nPrecision, Recall, and F1-Score (With Upsampling)', 
+                 fontsize=14, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(classes)
     ax.legend()
     ax.set_ylim(0, 1.0)
     ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
     
-    # Add value labels
     for bars in [bars1, bars2, bars3]:
         for bar in bars:
             height = bar.get_height()
@@ -230,11 +288,10 @@ def plot_class_performance(results, classes, save_path):
 def plot_cv_scores(cv_scores, save_path):
     """Plot cross-validation scores."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    
     folds = range(1, len(cv_scores) + 1)
     colors = ['#3498db' if s >= cv_scores.mean() else '#e74c3c' for s in cv_scores]
     
-    bars = ax.bar(folds, cv_scores, color=colors, edgecolor='black', linewidth=1.2)
+    ax.bar(folds, cv_scores, color=colors, edgecolor='black', linewidth=1.2)
     ax.axhline(y=cv_scores.mean(), color='green', linestyle='--', linewidth=2, 
                label=f'Mean: {cv_scores.mean():.4f}')
     ax.fill_between([0.5, len(cv_scores) + 0.5], 
@@ -244,7 +301,7 @@ def plot_cv_scores(cv_scores, save_path):
     
     ax.set_xlabel('Fold', fontsize=12)
     ax.set_ylabel("Cohen's Kappa", fontsize=12)
-    ax.set_title("5-Fold Cross-Validation Results", fontsize=14, fontweight='bold')
+    ax.set_title("5-Fold Cross-Validation Results (With Upsampling)", fontsize=14, fontweight='bold')
     ax.set_xticks(folds)
     ax.legend()
     ax.set_ylim(0, max(cv_scores) * 1.2)
@@ -255,36 +312,44 @@ def plot_cv_scores(cv_scores, save_path):
     print(f"    Saved: {save_path}")
 
 
-def plot_class_distribution(y, classes, save_path):
-    """Plot class distribution pie chart and bar chart."""
+def plot_class_distribution_comparison(df_original, df_combined, save_path):
+    """Plot class distribution before and after upsampling."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
-    # Count classes from encoded y values
-    unique, counts = np.unique(y, return_counts=True)
+    colors = {'high': '#e74c3c', 'low': '#f39c12', 'moderate': '#3498db', 'unburned': '#2ecc71'}
     
-    # Map to class names
-    counts_ordered = list(counts)
+    # Original distribution
+    orig_counts = df_original['SBS'].value_counts()
+    orig_counts = orig_counts.reindex(['high', 'low', 'moderate', 'unburned'])
+    bars1 = axes[0].bar(orig_counts.index, orig_counts.values, 
+                        color=[colors[c] for c in orig_counts.index], edgecolor='black')
+    axes[0].set_title('Original Data\n(Without Upsampling)', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Burn Severity Class', fontsize=12)
+    axes[0].set_ylabel('Number of Samples', fontsize=12)
+    for bar, count in zip(bars1, orig_counts.values):
+        axes[0].annotate(f'{count}',
+                        xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha='center', va='bottom', fontsize=11, fontweight='bold')
     
-    # Colors
-    colors = ['#e74c3c', '#f39c12', '#3498db', '#2ecc71'][:len(classes)]
-    
-    # Pie chart
-    axes[0].pie(counts_ordered, labels=classes, autopct='%1.1f%%', colors=colors,
-                startangle=90)
-    axes[0].set_title('Test Set Class Distribution', fontsize=14, fontweight='bold')
-    
-    # Bar chart
-    bars = axes[1].bar(classes, counts_ordered, color=colors, edgecolor='black')
+    # Combined distribution
+    comb_counts = df_combined['SBS'].value_counts()
+    comb_counts = comb_counts.reindex(['high', 'low', 'moderate', 'unburned'])
+    bars2 = axes[1].bar(comb_counts.index, comb_counts.values,
+                        color=[colors[c] for c in comb_counts.index], edgecolor='black')
+    axes[1].set_title('Combined Data\n(With Upsampled Unburned)', fontsize=14, fontweight='bold')
     axes[1].set_xlabel('Burn Severity Class', fontsize=12)
     axes[1].set_ylabel('Number of Samples', fontsize=12)
-    axes[1].set_title('Test Set Sample Count by Class', fontsize=14, fontweight='bold')
-    
-    for bar, count in zip(bars, counts_ordered):
+    for bar, count in zip(bars2, comb_counts.values):
         axes[1].annotate(f'{count}',
                         xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                        xytext=(0, 3),
-                        textcoords="offset points",
+                        xytext=(0, 3), textcoords="offset points",
                         ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    # Make y-axis same scale
+    max_val = max(orig_counts.max(), comb_counts.max())
+    axes[0].set_ylim(0, max_val * 1.15)
+    axes[1].set_ylim(0, max_val * 1.15)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -315,7 +380,7 @@ def plot_learning_curve(model, X, y, save_path):
     
     plt.xlabel('Training Set Size', fontsize=12)
     plt.ylabel("Cohen's Kappa", fontsize=12)
-    plt.title('Learning Curve\nRandom Forest Model', fontsize=14, fontweight='bold')
+    plt.title('Learning Curve\nRandom Forest Model (With Upsampling)', fontsize=14, fontweight='bold')
     plt.legend(loc='lower right')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -324,18 +389,17 @@ def plot_learning_curve(model, X, y, save_path):
     print(f"    Saved: {save_path}")
 
 
-def create_summary_dashboard(results, cv_scores, classes, model_path, save_path):
+def create_summary_dashboard(results, cv_scores, classes, train_size, test_size, 
+                            orig_unburned, total_unburned, model_path, save_path):
     """Create a summary dashboard with key metrics."""
     fig = plt.figure(figsize=(16, 12))
     
-    # Title
-    fig.suptitle('Wildfire Burn Severity Model - Evaluation Summary\n(No Upsampling, Top 30 Features)', 
+    fig.suptitle('Wildfire Burn Severity Model - Evaluation Summary\n(With Upsampled Unburned Points, Top 30 Features)', 
                  fontsize=16, fontweight='bold', y=0.98)
     
-    # Create grid
     gs = fig.add_gridspec(3, 3, hspace=0.4, wspace=0.3)
     
-    # 1. Key Metrics Box (top left)
+    # 1. Key Metrics Box
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.axis('off')
     metrics_text = f"""
@@ -350,12 +414,17 @@ def create_summary_dashboard(results, cv_scores, classes, model_path, save_path)
     Model: Random Forest
     Trees: 300
     Max Depth: 20
+    
+    UPSAMPLING
+    ═══════════════════
+    Original unburned: {orig_unburned}
+    Total unburned: {total_unburned}
     """
-    ax1.text(0.1, 0.5, metrics_text, transform=ax1.transAxes, fontsize=11,
+    ax1.text(0.1, 0.5, metrics_text, transform=ax1.transAxes, fontsize=10,
              verticalalignment='center', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
     
-    # 2. Confusion Matrix (top middle and right)
+    # 2. Confusion Matrix
     ax2 = fig.add_subplot(gs[0, 1:])
     cm = results['confusion_matrix']
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -364,13 +433,13 @@ def create_summary_dashboard(results, cv_scores, classes, model_path, save_path)
     ax2.set_xlabel('Predicted')
     ax2.set_ylabel('Actual')
     
-    # 3. Class Performance (middle row)
+    # 3. Class Performance
     ax3 = fig.add_subplot(gs[1, :])
     x = np.arange(len(classes))
     width = 0.25
-    bars1 = ax3.bar(x - width, results['precision'], width, label='Precision', color='#2ecc71')
-    bars2 = ax3.bar(x, results['recall'], width, label='Recall', color='#3498db')
-    bars3 = ax3.bar(x + width, results['f1'], width, label='F1-Score', color='#9b59b6')
+    ax3.bar(x - width, results['precision'], width, label='Precision', color='#2ecc71')
+    ax3.bar(x, results['recall'], width, label='Recall', color='#3498db')
+    ax3.bar(x + width, results['f1'], width, label='F1-Score', color='#9b59b6')
     ax3.set_xlabel('Burn Severity Class')
     ax3.set_ylabel('Score')
     ax3.set_title('Performance by Class', fontsize=12, fontweight='bold')
@@ -380,7 +449,7 @@ def create_summary_dashboard(results, cv_scores, classes, model_path, save_path)
     ax3.set_ylim(0, 1.0)
     ax3.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
     
-    # 4. CV Scores (bottom left)
+    # 4. CV Scores
     ax4 = fig.add_subplot(gs[2, 0])
     folds = range(1, len(cv_scores) + 1)
     colors = ['#3498db' if s >= cv_scores.mean() else '#e74c3c' for s in cv_scores]
@@ -391,27 +460,28 @@ def create_summary_dashboard(results, cv_scores, classes, model_path, save_path)
     ax4.set_title('Cross-Validation Scores', fontsize=12, fontweight='bold')
     ax4.set_xticks(folds)
     
-    # 5. Class Distribution (bottom middle)
+    # 5. Class Distribution
     ax5 = fig.add_subplot(gs[2, 1])
-    unique, counts = np.unique([classes[i] for i in range(len(classes))], return_counts=True)
     support = results['support']
     colors_pie = ['#e74c3c', '#f39c12', '#3498db', '#2ecc71']
     ax5.pie(support, labels=classes, autopct='%1.1f%%', colors=colors_pie)
     ax5.set_title('Test Set Distribution', fontsize=12, fontweight='bold')
     
-    # 6. Model Info (bottom right)
+    # 6. Model Info
     ax6 = fig.add_subplot(gs[2, 2])
     ax6.axis('off')
     info_text = f"""
     MODEL SAVED
     ═══════════════════
-    Path: {model_path}
+    Path: {os.path.basename(model_path)}
     
     Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}
     
     Features: 30
-    Training samples: 1729
-    Test samples: 433
+    Training samples: {train_size}
+    Test samples: {test_size}
+    
+    Upsampling: ENABLED
     """
     ax6.text(0.1, 0.5, info_text, transform=ax6.transAxes, fontsize=10,
              verticalalignment='center', fontfamily='monospace',
@@ -426,23 +496,21 @@ def create_summary_dashboard(results, cv_scores, classes, model_path, save_path)
 # MODEL SAVING
 # ============================================================================
 
-def save_model(model, label_encoder, features, results, cv_scores, save_dir):
+def save_model(model, label_encoder, features, results, cv_scores, 
+               orig_unburned, total_unburned, save_dir):
     """Save model and associated metadata."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Save model
-    model_filename = f'rf_burn_severity_no_upsampling_{timestamp}.joblib'
+    model_filename = f'rf_burn_severity_with_upsampling_{timestamp}.joblib'
     model_path = os.path.join(save_dir, model_filename)
     joblib.dump(model, model_path)
     print(f"    Model saved: {model_path}")
     
-    # Save label encoder
     le_filename = f'label_encoder_{timestamp}.joblib'
     le_path = os.path.join(save_dir, le_filename)
     joblib.dump(label_encoder, le_path)
     print(f"    Label encoder saved: {le_path}")
     
-    # Save metadata
     metadata = {
         'timestamp': timestamp,
         'model_type': 'RandomForestClassifier',
@@ -454,14 +522,17 @@ def save_model(model, label_encoder, features, results, cv_scores, save_dir):
         'classes': list(label_encoder.classes_),
         'test_kappa': results['kappa'],
         'test_accuracy': results['accuracy'],
-        'cv_kappa_mean': cv_scores.mean(),
-        'cv_kappa_std': cv_scores.std(),
+        'cv_kappa_mean': float(cv_scores.mean()),
+        'cv_kappa_std': float(cv_scores.std()),
         'cv_scores': cv_scores.tolist(),
         'precision_per_class': dict(zip(label_encoder.classes_, results['precision'].tolist())),
         'recall_per_class': dict(zip(label_encoder.classes_, results['recall'].tolist())),
         'f1_per_class': dict(zip(label_encoder.classes_, results['f1'].tolist())),
-        'upsampling': False,
-        'data_file': DATA_PATH
+        'upsampling': True,
+        'original_unburned_count': orig_unburned,
+        'total_unburned_count': total_unburned,
+        'original_data_file': ORIGINAL_DATA_PATH,
+        'upsampled_data_file': UPSAMPLED_DATA_PATH
     }
     
     metadata_filename = f'model_metadata_{timestamp}.json'
@@ -481,23 +552,41 @@ def save_model(model, label_encoder, features, results, cv_scores, save_dir):
 
 def main():
     print("="*80)
-    print("WILDFIRE BURN SEVERITY MODEL - NO UPSAMPLING")
+    print("WILDFIRE BURN SEVERITY MODEL - WITH UPSAMPLING")
     print("="*80)
     
-    # Load data
-    print("\n[1] Loading data...")
-    df = load_data(DATA_PATH)
-    print(f"    Total samples: {len(df)}")
+    # Load original data
+    print("\n[1] Loading original data...")
+    df_original = load_original_data(ORIGINAL_DATA_PATH)
+    print(f"    Original samples: {len(df_original)}")
     
-    # Class distribution
-    print("\n[2] Class Distribution:")
-    for cls, count in df['SBS'].value_counts().items():
-        pct = count / len(df) * 100
+    # Load upsampled data
+    print("\n[2] Loading upsampled unburned data...")
+    df_upsampled = load_upsampled_data(UPSAMPLED_DATA_PATH)
+    print(f"    Upsampled unburned points: {len(df_upsampled)}")
+    
+    # Original class distribution
+    print("\n[3] Original Class Distribution:")
+    orig_unburned = len(df_original[df_original['SBS'] == 'unburned'])
+    for cls, count in df_original['SBS'].value_counts().items():
+        pct = count / len(df_original) * 100
+        print(f"    {cls:12s}: {count:4d} ({pct:.1f}%)")
+    
+    # Combine datasets
+    print("\n[4] Combining datasets...")
+    df_combined = combine_datasets(df_original, df_upsampled, include_upsampling=True)
+    total_unburned = len(df_combined[df_combined['SBS'] == 'unburned'])
+    print(f"    Combined samples: {len(df_combined)}")
+    
+    # Combined class distribution
+    print("\n[5] Combined Class Distribution:")
+    for cls, count in df_combined['SBS'].value_counts().items():
+        pct = count / len(df_combined) * 100
         print(f"    {cls:12s}: {count:4d} ({pct:.1f}%)")
     
     # Prepare features
-    print("\n[3] Preparing features...")
-    X, y, features = prepare_features(df, TOP_30_FEATURES)
+    print("\n[6] Preparing features...")
+    X, y, features = prepare_features(df_combined, TOP_30_FEATURES)
     print(f"    Using {len(features)} features")
     
     # Encode labels
@@ -505,22 +594,22 @@ def main():
     y_encoded = le.fit_transform(y)
     print(f"    Classes: {list(le.classes_)}")
     
-    # Train/test split
+    # Train/test split (stratified)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y_encoded, test_size=TEST_SIZE, stratify=y_encoded, random_state=RANDOM_STATE
     )
     print(f"\n    Train: {len(X_train)}, Test: {len(X_test)}")
     
     # Train model
-    print("\n[4] Training Random Forest...")
+    print("\n[7] Training Random Forest...")
     model = train_random_forest(X_train, y_train)
     
     # Evaluate
-    print("\n[5] Evaluating model...")
+    print("\n[8] Evaluating model...")
     results = evaluate_model(model, X_test, y_test, le)
     
     # Cross-validation
-    print("\n[6] Running cross-validation...")
+    print("\n[9] Running cross-validation...")
     cv_scores = cross_validate(model, X, y_encoded)
     
     # Print results
@@ -546,44 +635,46 @@ def main():
     
     # Save model
     print("\n" + "="*80)
-    print("[7] Saving model...")
+    print("[10] Saving model...")
     print("="*80)
-    model_path, metadata = save_model(model, le, features, results, cv_scores, MODELS_DIR)
+    model_path, metadata = save_model(
+        model, le, features, results, cv_scores, 
+        orig_unburned, total_unburned, MODELS_DIR
+    )
     
     # Generate visualizations
     print("\n" + "="*80)
-    print("[8] Generating visualizations...")
+    print("[11] Generating visualizations...")
     print("="*80)
     
-    # Individual plots
     plot_confusion_matrix(
         results['confusion_matrix'], le.classes_,
-        os.path.join(RESULTS_DIR, 'confusion_matrix.png')
+        os.path.join(RESULTS_DIR, 'confusion_matrix_upsampled.png')
     )
     
     plot_normalized_confusion_matrix(
         results['confusion_matrix'], le.classes_,
-        os.path.join(RESULTS_DIR, 'confusion_matrix_normalized.png')
+        os.path.join(RESULTS_DIR, 'confusion_matrix_normalized_upsampled.png')
     )
     
     plot_feature_importance(
         model, features,
-        os.path.join(RESULTS_DIR, 'feature_importance.png')
+        os.path.join(RESULTS_DIR, 'feature_importance_upsampled.png')
     )
     
     plot_class_performance(
         results, le.classes_,
-        os.path.join(RESULTS_DIR, 'class_performance.png')
+        os.path.join(RESULTS_DIR, 'class_performance_upsampled.png')
     )
     
     plot_cv_scores(
         cv_scores,
-        os.path.join(RESULTS_DIR, 'cv_scores.png')
+        os.path.join(RESULTS_DIR, 'cv_scores_upsampled.png')
     )
     
-    plot_class_distribution(
-        y_test, le.classes_,
-        os.path.join(RESULTS_DIR, 'class_distribution.png')
+    plot_class_distribution_comparison(
+        df_original, df_combined,
+        os.path.join(RESULTS_DIR, 'class_distribution_comparison.png')
     )
     
     print("\n    Generating learning curve (this may take a moment)...")
@@ -591,13 +682,13 @@ def main():
         RandomForestClassifier(n_estimators=100, max_depth=20, class_weight='balanced', 
                               random_state=RANDOM_STATE, n_jobs=-1),
         X, y_encoded,
-        os.path.join(RESULTS_DIR, 'learning_curve.png')
+        os.path.join(RESULTS_DIR, 'learning_curve_upsampled.png')
     )
     
-    # Summary dashboard
     create_summary_dashboard(
-        results, cv_scores, le.classes_, model_path,
-        os.path.join(RESULTS_DIR, 'evaluation_summary_dashboard.png')
+        results, cv_scores, le.classes_, len(X_train), len(X_test),
+        orig_unburned, total_unburned, model_path,
+        os.path.join(RESULTS_DIR, 'evaluation_summary_dashboard_upsampled.png')
     )
     
     # Summary
@@ -607,33 +698,35 @@ def main():
     print(f"""
 Model: Random Forest (300 trees, max_depth=20, balanced weights)
 Features: Top 30 from feature importance analysis
-Data: Original data only (no upsampling)
+Data: Original + Upsampled unburned points
+
+Upsampling Impact:
+- Original unburned: {orig_unburned} samples
+- After upsampling: {total_unburned} samples (+{total_unburned - orig_unburned})
+- Total dataset: {len(df_combined)} samples
 
 Results:
 - Test Kappa: {results['kappa']:.4f}
 - Test Accuracy: {results['accuracy']:.4f}
 - CV Kappa: {cv_scores.mean():.4f} (+/- {cv_scores.std()*2:.4f})
 
-Class Performance:
-- High severity:   {results['recall'][0]*100:.1f}% recall
-- Low severity:    {results['recall'][1]*100:.1f}% recall  
-- Moderate:        {results['recall'][2]*100:.1f}% recall
-- Unburned:        {results['recall'][3]*100:.1f}% recall
+Class Performance (Recall):
+- High severity:   {results['recall'][0]*100:.1f}%
+- Low severity:    {results['recall'][1]*100:.1f}%  
+- Moderate:        {results['recall'][2]*100:.1f}%
+- Unburned:        {results['recall'][3]*100:.1f}%
 
 Files Saved:
 - Model: {model_path}
 - Visualizations: {RESULTS_DIR}/
-
-Note: Unburned class has only {len(df[df['SBS']=='unburned'])} samples (4%)
-      Consider using upsampled data for better unburned classification.
     """)
     
     print("="*80)
     print("COMPLETE")
     print("="*80)
     
-    return model, results, le, metadata
+    return model, results, le, metadata, df_combined
 
 
 if __name__ == "__main__":
-    model, results, label_encoder, metadata = main()
+    model, results, label_encoder, metadata, df_combined = main()

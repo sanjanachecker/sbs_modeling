@@ -1,0 +1,80 @@
+{
+  "timestamp": "20251229_151156",
+  "model_type": "RandomForestClassifier",
+  "n_estimators": 300,
+  "max_depth": 20,
+  "class_weight": "balanced",
+  "features": [
+    "dnbr",
+    "dndvi",
+    "dndbi",
+    "dbsi",
+    "nbr",
+    "bsi",
+    "ndvi",
+    "ndbi",
+    "meanelev_32",
+    "wc_bio19",
+    "nirBand",
+    "wc_bio05",
+    "rdgh_6",
+    "blueBand",
+    "minelev_4",
+    "greenBand",
+    "wc_bio06",
+    "swir2Band",
+    "pisrdif_2021-11-22",
+    "pisrdif_2021-12-22",
+    "stddevelev_32",
+    "maxc_2",
+    "wc_bio12",
+    "wc_bio07",
+    "dmndwi",
+    "wc_bio18",
+    "wc_bio17",
+    "wc_bio02",
+    "vd_5",
+    "planc_32"
+  ],
+  "n_features": 30,
+  "classes": [
+    "high",
+    "low",
+    "moderate",
+    "unburned"
+  ],
+  "test_kappa": 0.6141933816828278,
+  "test_accuracy": 0.7259842519685039,
+  "cv_kappa_mean": 0.4182548760794522,
+  "cv_kappa_std": 0.02548128317052076,
+  "cv_scores": [
+    0.39987945877704156,
+    0.4618135206788707,
+    0.42890811625526104,
+    0.38902625435242777,
+    0.4116470303336598
+  ],
+  "precision_per_class": {
+    "high": 0.7142857142857143,
+    "low": 0.5966386554621849,
+    "moderate": 0.7142857142857143,
+    "unburned": 0.8024691358024691
+  },
+  "recall_per_class": {
+    "high": 0.5625,
+    "low": 0.5378787878787878,
+    "moderate": 0.7389162561576355,
+    "unburned": 0.8863636363636364
+  },
+  "f1_per_class": {
+    "high": 0.6293706293706294,
+    "low": 0.5657370517928287,
+    "moderate": 0.7263922518159807,
+    "unburned": 0.8423326133909287
+  },
+  "upsampling": true,
+  "original_unburned_count": 86,
+  "total_unburned_count": 1099,
+  "original_data_file": "data/all_fires_complete_covariates_fixed_129.csv",
+  "upsampled_data_file": "data/all_fires_upsampled_points_with_covariates_fixed_129.csv"
+}

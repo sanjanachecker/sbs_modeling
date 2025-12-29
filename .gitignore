@@ -4,10 +4,6 @@ venv/
 
 __pycache__/
 
-# Ignore CSV data files
-data/*
-*.csv
-
 # (optional) ignore Jupyter checkpoints if you use notebooks
 .ipynb_checkpoints/
 
