@@ -32,8 +32,8 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 # Data paths
-ORIGINAL_DATA_PATH = 'data/all_fires_complete_covariates_fixed_129.csv'
-UPSAMPLED_DATA_PATH = 'data/all_fires_upsampled_points_with_covariates_fixed_129.csv'
+ORIGINAL_DATA_PATH = 'data/real_all_fires_complete_covariates_fixed_1229.csv'
+UPSAMPLED_DATA_PATH = 'data/real_all_fires_upsampled_points_with_covariates_fixed.csv'
 
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
