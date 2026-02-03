@@ -9,6 +9,7 @@ Trains multiple model architectures:
 Compares all approaches to Random Forest baseline
 """
 
+import os
 import tensorflow as tf
 import numpy as np
 import pandas as pd
@@ -377,6 +378,222 @@ def train_model(model, X_train, y_train, X_val, y_val, class_weights, model_name
     
     return model, history
 
+# ============================================================================
+# VISUALIZATION (Enhanced)
+# ============================================================================
+
+def plot_training_history(history_dict, save_path):
+    """
+    Plot training and validation loss/accuracy for all models
+    """
+    n_models = len(history_dict)
+    fig, axes = plt.subplots(2, n_models, figsize=(6*n_models, 10))
+    
+    if n_models == 1:
+        axes = axes.reshape(-1, 1)
+    
+    for i, (model_name, history) in enumerate(history_dict.items()):
+        # Loss
+        axes[0, i].plot(history.history['loss'], label='Train Loss', linewidth=2)
+        axes[0, i].plot(history.history['val_loss'], label='Val Loss', linewidth=2)
+        axes[0, i].set_title(f'{model_name} - Loss', fontsize=12, fontweight='bold')
+        axes[0, i].set_xlabel('Epoch')
+        axes[0, i].set_ylabel('Loss')
+        axes[0, i].legend()
+        axes[0, i].grid(alpha=0.3)
+        
+        # Accuracy
+        axes[1, i].plot(history.history['accuracy'], label='Train Acc', linewidth=2)
+        axes[1, i].plot(history.history['val_accuracy'], label='Val Acc', linewidth=2)
+        axes[1, i].set_title(f'{model_name} - Accuracy', fontsize=12, fontweight='bold')
+        axes[1, i].set_xlabel('Epoch')
+        axes[1, i].set_ylabel('Accuracy')
+        axes[1, i].legend()
+        axes[1, i].grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved training history: {save_path}")
+
+
+def plot_metrics_comparison(results_dict, class_names, save_path):
+    """
+    Compare precision, recall, F1 across all models and classes
+    """
+    from sklearn.metrics import precision_recall_fscore_support
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    models = list(results_dict.keys())
+    x = np.arange(len(class_names))
+    width = 0.25
+    
+    # Extract metrics for each model
+    metrics_data = {}
+    for model_name, results in results_dict.items():
+        y_true = results['y_true']
+        y_pred = results['y_pred']
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=range(len(class_names)), zero_division=0
+        )
+        accuracy = (y_true == y_pred).mean()
+        
+        metrics_data[model_name] = {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'accuracy': accuracy
+        }
+    
+    # Plot 1: Precision by class
+    ax = axes[0, 0]
+    for i, model_name in enumerate(models):
+        offset = width * (i - len(models)/2 + 0.5)
+        bars = ax.bar(x + offset, metrics_data[model_name]['precision'], 
+                     width, label=model_name, alpha=0.8)
+    ax.set_xlabel('Class', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title('Precision by Class', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0, 1.0)
+    
+    # Plot 2: Recall by class
+    ax = axes[0, 1]
+    for i, model_name in enumerate(models):
+        offset = width * (i - len(models)/2 + 0.5)
+        bars = ax.bar(x + offset, metrics_data[model_name]['recall'], 
+                     width, label=model_name, alpha=0.8)
+    ax.set_xlabel('Class', fontsize=12)
+    ax.set_ylabel('Recall', fontsize=12)
+    ax.set_title('Recall by Class', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0, 1.0)
+    
+    # Plot 3: F1-Score by class
+    ax = axes[1, 0]
+    for i, model_name in enumerate(models):
+        offset = width * (i - len(models)/2 + 0.5)
+        bars = ax.bar(x + offset, metrics_data[model_name]['f1'], 
+                     width, label=model_name, alpha=0.8)
+    ax.set_xlabel('Class', fontsize=12)
+    ax.set_ylabel('F1-Score', fontsize=12)
+    ax.set_title('F1-Score by Class', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0, 1.0)
+    
+    # Plot 4: Overall accuracy comparison
+    ax = axes[1, 1]
+    accuracies = [metrics_data[m]['accuracy'] for m in models]
+    kappas = [results_dict[m]['kappa'] for m in models]
+    
+    x_pos = np.arange(len(models))
+    width = 0.35
+    
+    bars1 = ax.bar(x_pos - width/2, accuracies, width, label='Accuracy', alpha=0.8, color='#3498db')
+    bars2 = ax.bar(x_pos + width/2, kappas, width, label="Cohen's Kappa", alpha=0.8, color='#e74c3c')
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom',
+                       fontsize=10, fontweight='bold')
+    
+    ax.set_xlabel('Model', fontsize=12)
+    ax.set_ylabel('Score', fontsize=12)
+    ax.set_title('Overall Performance Metrics', fontsize=14, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(models)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved metrics comparison: {save_path}")
+
+
+def plot_model_comparison(results_dict, save_path):
+    """
+    Compare multiple models (Kappa only - simplified)
+    """
+    models = list(results_dict.keys())
+    kappas = [results_dict[m]['kappa'] for m in models]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12']
+    bars = ax.bar(models, kappas, color=colors[:len(models)], edgecolor='black', linewidth=1.5)
+    
+    for bar, kappa in zip(bars, kappas):
+        height = bar.get_height()
+        ax.annotate(f'{kappa:.4f}',
+                   xy=(bar.get_x() + bar.get_width() / 2, height),
+                   xytext=(0, 3),
+                   textcoords="offset points",
+                   ha='center', va='bottom',
+                   fontsize=12, fontweight='bold')
+    
+    ax.set_ylabel("Cohen's Kappa", fontsize=12)
+    ax.set_title("Model Comparison - Burn Severity Classification", fontsize=14, fontweight='bold')
+    ax.set_ylim(0, max(kappas) * 1.2)
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved comparison: {save_path}")
+
+
+def plot_confusion_matrices(results_dict, class_names, save_dir):
+    """
+    Plot confusion matrix for each model
+    """
+    n_models = len(results_dict)
+    fig, axes = plt.subplots(1, n_models, figsize=(6*n_models, 5))
+    
+    if n_models == 1:
+        axes = [axes]
+    
+    for ax, (model_name, results) in zip(axes, results_dict.items()):
+        cm = results['confusion_matrix']
+        
+        # Normalize for percentages
+        cm_pct = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+        
+        # Create annotations with both count and percentage
+        annot = np.empty_like(cm, dtype=object)
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                annot[i, j] = f'{cm[i, j]}\n({cm_pct[i, j]:.1f}%)'
+        
+        sns.heatmap(cm, annot=annot, fmt='', cmap='Blues',
+                   xticklabels=class_names, yticklabels=class_names, ax=ax,
+                   cbar_kws={'label': 'Count'})
+        ax.set_title(f'{model_name}\nKappa: {results["kappa"]:.4f}', fontweight='bold', fontsize=12)
+        ax.set_xlabel('Predicted', fontsize=11)
+        ax.set_ylabel('True', fontsize=11)
+    
+    plt.tight_layout()
+    save_path = f'{save_dir}/confusion_matrices_comparison.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved confusion matrices: {save_path}")
 
 def evaluate_model(model, X_test, y_test, model_name, class_names):
     """
@@ -397,6 +614,7 @@ def evaluate_model(model, X_test, y_test, model_name, class_names):
     
     return {
         'kappa': kappa,
+        'y_true': y_test,
         'y_pred': y_pred,
         'y_pred_proba': y_pred_proba,
         'confusion_matrix': cm
@@ -558,22 +776,32 @@ def main():
     )
     
     # Generate visualizations
+    # Generate visualizations
     print("\n" + "=" * 80)
     print("GENERATING VISUALIZATIONS")
     print("=" * 80)
     
-    output_dir = '/mnt/user-data/outputs'
-    plot_model_comparison(results, f'{output_dir}/model_comparison.png')
+    # Create output directory
+    output_dir = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save all visualizations
+    plot_model_comparison(results, f'{output_dir}/multimodal_model_comparison_kappa.png')
     plot_confusion_matrices(results, class_names, output_dir)
+    plot_metrics_comparison(results, class_names, f'{output_dir}/multimodal_metrics_comparison.png')
+    plot_training_history(
+        {'CNN': cnn_history, 'MLP': mlp_history, 'Hybrid': hybrid_history},
+        f'{output_dir}/training_history.png'
+    )
     
     # Save models
     print("\n" + "=" * 80)
     print("SAVING MODELS")
     print("=" * 80)
     
-    cnn_model.save(f'{output_dir}/cnn_model.keras')
-    mlp_model.save(f'{output_dir}/mlp_model.keras')
-    hybrid_model.save(f'{output_dir}/hybrid_model.keras')
+    cnn_model.save(f'{output_dir}/multimodal_cnn_model.keras')
+    mlp_model.save(f'{output_dir}/multimodal_mlp_model.keras')
+    hybrid_model.save(f'{output_dir}/multimodal_hybrid_model.keras')
     
     print("\n" + "=" * 80)
     print("FINAL RESULTS SUMMARY")
