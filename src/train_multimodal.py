@@ -692,13 +692,13 @@ def main():
     print("=" * 80)
     
     # Load data
-    tfrecord_dir = '/Users/sanjanachecker/Downloads/fire_patches2'  # Adjust path
+    tfrecord_dir = '/Users/sanjanachecker/csc/fire_patches2'
     
     data = load_tfrecords(
         tfrecord_dir,
         include_patches=True,
         include_covariates=True,
-        limit=None  # Set to small number for testing, None for all
+        limit=None
     )
     
     X_patches = data['patches']
@@ -776,7 +776,6 @@ def main():
     )
     
     # Generate visualizations
-    # Generate visualizations
     print("\n" + "=" * 80)
     print("GENERATING VISUALIZATIONS")
     print("=" * 80)
@@ -794,15 +793,84 @@ def main():
         f'{output_dir}/training_history.png'
     )
     
-    # Save models
+    # Save models (.keras format for local use)
     print("\n" + "=" * 80)
-    print("SAVING MODELS")
+    print("SAVING MODELS (.keras)")
     print("=" * 80)
     
     cnn_model.save(f'{output_dir}/multimodal_cnn_model.keras')
     mlp_model.save(f'{output_dir}/multimodal_mlp_model.keras')
     hybrid_model.save(f'{output_dir}/multimodal_hybrid_model.keras')
+    print("✅ Keras models saved")
     
+    # ========================================================================
+    # EXPORT MLP FOR GEE DEPLOYMENT
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("EXPORTING MLP MODEL FOR GEE DEPLOYMENT")
+    print("=" * 80)
+    
+    # Create GEE export directory
+    gee_export_dir = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/gee_models'
+    os.makedirs(gee_export_dir, exist_ok=True)
+    
+    # Export MLP as SavedModel (TensorFlow serving format)
+    mlp_export_path = f'{gee_export_dir}/mlp_burn_severity'
+    try:
+        mlp_model.export(mlp_export_path)
+        print(f"✅ MLP SavedModel exported to: {mlp_export_path}")
+    except Exception as e:
+        print(f"⚠️  Error exporting SavedModel: {e}")
+        print("   Attempting alternative export method...")
+        tf.saved_model.save(mlp_model, mlp_export_path)
+        print(f"✅ MLP SavedModel exported (alternative method)")
+    
+    # Save model metadata for GEE
+    model_metadata = {
+        'model_type': 'MLP',
+        'feature_names': TOP_30_FEATURES,
+        'n_features': len(TOP_30_FEATURES),
+        'class_names': class_names,
+        'class_mapping': CLASS_MAP,
+        'input_shape': [30],
+        'output_shape': [4],
+        'scaler_mean': scaler.mean_.tolist(),
+        'scaler_scale': scaler.scale_.tolist(),
+        'training_info': {
+            'n_train_samples': len(y_train),
+            'n_val_samples': len(y_val),
+            'n_test_samples': len(y_test),
+            'test_kappa': float(results['MLP']['kappa']),
+            'batch_size': BATCH_SIZE,
+            'epochs_trained': len(mlp_history.history['loss']),
+            'learning_rate': LEARNING_RATE,
+        },
+        'export_date': datetime.now().isoformat(),
+    }
+    
+    metadata_path = f'{gee_export_dir}/model_metadata.json'
+    with open(metadata_path, 'w') as f:
+        json.dump(model_metadata, f, indent=2)
+    print(f"✅ Model metadata saved: {metadata_path}")
+    
+    # Save scaler as pickle for easy loading
+    import pickle
+    scaler_path = f'{gee_export_dir}/scaler.pkl'
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    print(f"✅ Scaler saved: {scaler_path}")
+    
+    print("\n" + "=" * 80)
+    print("GEE EXPORT COMPLETE")
+    print("=" * 80)
+    print(f"\nFiles created:")
+    print(f"  1. SavedModel: {mlp_export_path}/")
+    print(f"  2. Metadata:   {metadata_path}")
+    print(f"  3. Scaler:     {scaler_path}")
+    
+    # ========================================================================
+    # FINAL SUMMARY
+    # ========================================================================
     print("\n" + "=" * 80)
     print("FINAL RESULTS SUMMARY")
     print("=" * 80)
