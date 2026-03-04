@@ -5,7 +5,7 @@ Uses top 30 features from feature importance analysis
 Combines original data WITH upsampled unburned points
 Generates evaluation visualizations and saves model
 
-Date: December 2024
+Date: March 2026
 """
 
 import pandas as pd
@@ -148,8 +148,8 @@ def prepare_features(df, feature_list):
 def train_random_forest(X_train, y_train, class_weight='balanced'):
     """Train a Random Forest classifier."""
     rf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=15,
+        n_estimators=500,
+        max_depth=None,
         min_samples_split=5,
         min_samples_leaf=2,
         class_weight=class_weight,
@@ -514,8 +514,8 @@ def save_model(model, label_encoder, features, results, cv_scores,
     metadata = {
         'timestamp': timestamp,
         'model_type': 'RandomForestClassifier',
-        'n_estimators': 300,
-        'max_depth': 20,
+        'n_estimators': 500,
+        'max_depth': None,
         'class_weight': 'balanced',
         'features': features,
         'n_features': len(features),
@@ -696,7 +696,7 @@ def main():
     print("SUMMARY")
     print("="*80)
     print(f"""
-Model: Random Forest (300 trees, max_depth=20, balanced weights)
+Model: Random Forest (500 trees, max_depth=None, balanced weights)
 Features: Top 30 from feature importance analysis
 Data: Original + Upsampled unburned points
 
