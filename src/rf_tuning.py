@@ -1,41 +1,43 @@
 """
-RF Burn Severity — Hyperparameter Tuning + TF Export
-=====================================================
-1. Tests top 30 vs all features
-2. GridSearch over RF hyperparameters
-3. Wraps best RF in TensorFlow SavedModel for GEE pipeline
+Burn Severity — 10-Fold Stratified CV Model Search
+====================================================
+Tests combinations of:
+  Models: RF, XGBoost, ExtraTrees, GradientBoosting
+  Features: Top 30, Top 50, Top 75, All
+  Data: No upsampling, Old upsampled (moderate-matched)
+
+Outputs a ranked table of all combos by mean Kappa.
+Use the best combo in a separate LOFO + training script.
 """
 
 import pandas as pd
 import numpy as np
 import os
-import json
-import pickle
-import joblib
-from datetime import datetime
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.metrics import (
-    cohen_kappa_score, classification_report, confusion_matrix,
-    make_scorer, accuracy_score
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier,
+    ExtraTreesClassifier
 )
-from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import make_scorer, cohen_kappa_score
+from sklearn.utils.class_weight import compute_sample_weight
+import xgboost as xgb
 import matplotlib.pyplot as plt
-import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION — UPDATE PATHS
 # ============================================================================
 
 MAIN_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_complete_covariates_fixed_1229.csv'
-UPSAMPLED_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_upsampled_points_with_covariates_fixed123.csv'
-OUTPUT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results_rf_tuned'
-GEE_EXPORT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/gee_models_rf'
+OLD_UPSAMPLED_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_upsampled_points_with_covariates_fixed.csv'
+OUTPUT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results_model_search'
 
 RANDOM_STATE = 42
-TEST_SIZE = 0.2
+N_FOLDS = 10
+
+CLASS_NAMES = ['unburned', 'low', 'moderate', 'high']
+LABEL_MAP = {'unburned': 0, 'low': 1, 'moderate': 2, 'high': 3}
 
 TOP_30_FEATURES = [
     'dnbr', 'dndvi', 'dndbi', 'dbsi', 'nbr', 'bsi', 'ndvi', 'ndbi',
@@ -45,14 +47,11 @@ TOP_30_FEATURES = [
     'dmndwi', 'wc_bio18', 'wc_bio17', 'wc_bio02', 'vd_5', 'planc_32'
 ]
 
-# Columns to exclude when using "all features"
 EXCLUDE_COLS = {
     'SBS', 'Fire_year', 'fire', 'source', 'data_source', 'Source',
     'PointX', 'PointY', '.geo', 'system:index', 'label',
     'latitude', 'longitude', 'lat', 'lon', 'x', 'y'
 }
-
-CLASS_NAMES = ['unburned', 'low', 'moderate', 'high']
 
 
 # ============================================================================
@@ -60,435 +59,324 @@ CLASS_NAMES = ['unburned', 'low', 'moderate', 'high']
 # ============================================================================
 
 def load_data():
-    """Load and combine CSVs."""
-    print("=" * 60)
+    """Load main + upsampled CSVs, return combined dataset."""
+    print("=" * 70)
     print("LOADING DATA")
-    print("=" * 60)
+    print("=" * 70)
 
     df_main = pd.read_csv(MAIN_CSV)
     df_main['SBS'] = df_main['SBS'].replace({'mod': 'moderate'})
+    df_main = df_main[df_main['SBS'].isin(CLASS_NAMES)].copy()
     print(f"Main CSV: {len(df_main)} rows")
 
-    df_up = pd.read_csv(UPSAMPLED_CSV)
-    print(f"Upsampled CSV: {len(df_up)} rows")
-
-    # Find common columns
+    df_up = pd.read_csv(OLD_UPSAMPLED_CSV)
     common_cols = list(set(df_main.columns) & set(df_up.columns))
-    df_main_sub = df_main[common_cols].copy()
-    df_up_sub = df_up[common_cols].copy()
+    df = pd.concat([df_main[common_cols], df_up[common_cols]], ignore_index=True)
+    df['SBS'] = df['SBS'].replace({'mod': 'moderate'})
+    df = df[df['SBS'].isin(CLASS_NAMES)].copy()
+    print(f"With upsampling: {len(df)} rows")
 
-    df_main_sub['data_source'] = 'original'
-    df_up_sub['data_source'] = 'upsampled'
-
-    df = pd.concat([df_main_sub, df_up_sub], ignore_index=True)
-    df = df.dropna(subset=['SBS'])
-    df = df[df['SBS'].isin(['unburned', 'low', 'moderate', 'high'])]
-
-    print(f"Combined: {len(df)} rows")
-    print("\nClass distribution:")
     for cls in CLASS_NAMES:
         count = (df['SBS'] == cls).sum()
         print(f"  {cls:12s}: {count:5d} ({count/len(df)*100:.1f}%)")
 
-    return df
+    return {'OldUp': df}
 
 
-def get_all_numeric_features(df):
-    """Get all numeric feature columns (excluding metadata)."""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [c for c in numeric_cols if c.lower() not in {x.lower() for x in EXCLUDE_COLS}]
-    return sorted(feature_cols)
-
-
-# ============================================================================
-# TUNING
-# ============================================================================
-
-def run_experiment(df, features, label, param_grid=None):
-    """Run a single experiment with given features and optional grid search."""
-    print(f"\n{'='*60}")
-    print(f"EXPERIMENT: {label}")
-    print(f"{'='*60}")
-    print(f"Features: {len(features)}")
-
-    # Prepare data
-    available = [f for f in features if f in df.columns]
-    missing = [f for f in features if f not in df.columns]
-    if missing:
-        print(f"Missing {len(missing)} features: {missing[:5]}...")
+def get_top_n_features(df, n):
+    """Rank features by RF importance, return top N."""
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    all_feats = sorted([c for c in numeric if c.lower() not in {x.lower() for x in EXCLUDE_COLS}])
+    available = [f for f in all_feats if f in df.columns]
 
     X = df[available].fillna(df[available].median()).values.astype(np.float32)
+    X = np.where(np.isnan(X) | np.isinf(X), 0.0, X)
     y = df['SBS'].values
 
-    # Handle NaN/Inf
-    nan_mask = np.isnan(X) | np.isinf(X)
-    if nan_mask.any():
-        print(f"Replacing {nan_mask.sum()} NaN/Inf with 0")
-        X = np.where(nan_mask, 0.0, X)
-
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    rf = RandomForestClassifier(
+        n_estimators=300, max_depth=None, class_weight='balanced',
+        random_state=RANDOM_STATE, n_jobs=-1
     )
-    print(f"Train: {len(y_train)}, Test: {len(y_test)}")
+    rf.fit(X, y)
 
-    # Grid search or single model
-    kappa_scorer = make_scorer(cohen_kappa_score)
+    indices = np.argsort(rf.feature_importances_)[::-1][:n]
+    return [available[i] for i in indices]
 
-    if param_grid:
-        print(f"\nRunning GridSearchCV...")
-        base_rf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
-        grid = GridSearchCV(
-            base_rf, param_grid, cv=5, scoring=kappa_scorer,
-            verbose=1, n_jobs=-1, refit=True
-        )
-        grid.fit(X_train, y_train)
 
-        best_model = grid.best_estimator_
-        print(f"\nBest params: {grid.best_params_}")
-        print(f"Best CV Kappa: {grid.best_score_:.4f}")
+def get_all_features(df):
+    """Get all numeric feature columns."""
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    return sorted([c for c in numeric if c.lower() not in {x.lower() for x in EXCLUDE_COLS}])
 
-        # Show top 5 results
-        results_df = pd.DataFrame(grid.cv_results_)
-        results_df = results_df.sort_values('rank_test_score')
-        print("\nTop 5 configurations:")
-        for _, row in results_df.head(5).iterrows():
-            print(f"  Kappa={row['mean_test_score']:.4f} (+/-{row['std_test_score']:.4f}) — {row['params']}")
-    else:
-        best_model = RandomForestClassifier(
+
+def prepare_xy(df, features):
+    """Extract X, y arrays from dataframe."""
+    available = [f for f in features if f in df.columns]
+    X = df[available].fillna(df[available].median()).values.astype(np.float32)
+    X = np.where(np.isnan(X) | np.isinf(X), 0.0, X)
+    y = df['SBS'].values
+    return X, y, available
+
+
+# ============================================================================
+# MODEL DEFINITIONS
+# ============================================================================
+
+def get_models():
+    """Return dict of model name → model instance."""
+    return {
+        'RF_balanced': RandomForestClassifier(
             n_estimators=500, max_depth=None, min_samples_split=2,
             min_samples_leaf=1, class_weight='balanced',
             random_state=RANDOM_STATE, n_jobs=-1
-        )
-        best_model.fit(X_train, y_train)
-
-    # Evaluate on test set
-    y_pred = best_model.predict(X_test)
-    kappa = cohen_kappa_score(y_test, y_pred)
-    accuracy = accuracy_score(y_test, y_pred)
-
-    print(f"\n--- TEST SET RESULTS ---")
-    print(f"Cohen's Kappa:    {kappa:.4f}")
-    print(f"Overall Accuracy: {accuracy:.4f}")
-    print(f"\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=CLASS_NAMES))
-
-    cm = confusion_matrix(y_test, y_pred, labels=CLASS_NAMES)
-
-    # Moderate row analysis
-    mod_idx = CLASS_NAMES.index('moderate')
-    mod_row = cm[mod_idx]
-    mod_total = mod_row.sum()
-    print(f"Moderate row breakdown:")
-    for j, cls in enumerate(CLASS_NAMES):
-        print(f"  → {cls:12s}: {mod_row[j]:3d} ({mod_row[j]/mod_total*100:.1f}%)")
-
-    return {
-        'label': label,
-        'model': best_model,
-        'features': available,
-        'kappa': kappa,
-        'accuracy': accuracy,
-        'cm': cm,
-        'y_test': y_test,
-        'y_pred': y_pred,
-        'X_train': X_train,
-        'X_test': X_test,
-        'y_train': y_train,
-        'best_params': grid.best_params_ if param_grid else None
+        ),
+        'RF_bal_sub': RandomForestClassifier(
+            n_estimators=500, max_depth=20, min_samples_split=10,
+            min_samples_leaf=2, class_weight='balanced_subsample',
+            random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        'RF_1000trees': RandomForestClassifier(
+            n_estimators=1000, max_depth=25, min_samples_split=2,
+            min_samples_leaf=2, class_weight='balanced',
+            random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        'ExtraTrees': ExtraTreesClassifier(
+            n_estimators=500, max_depth=None, min_samples_split=2,
+            min_samples_leaf=1, class_weight='balanced',
+            random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        'ExtraTrees_tuned': ExtraTreesClassifier(
+            n_estimators=1000, max_depth=25, min_samples_split=5,
+            min_samples_leaf=2, class_weight='balanced_subsample',
+            random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        'GBM_default': GradientBoostingClassifier(
+            n_estimators=300, max_depth=5, learning_rate=0.1,
+            subsample=0.8, min_samples_split=5,
+            random_state=RANDOM_STATE
+        ),
+        'GBM_deep': GradientBoostingClassifier(
+            n_estimators=500, max_depth=8, learning_rate=0.05,
+            subsample=0.8, min_samples_split=10,
+            random_state=RANDOM_STATE
+        ),
+        'XGB_default': xgb.XGBClassifier(
+            n_estimators=500, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            objective='multi:softprob', num_class=4,
+            random_state=RANDOM_STATE, n_jobs=-1,
+            eval_metric='mlogloss'
+        ),
+        'XGB_deep': xgb.XGBClassifier(
+            n_estimators=800, max_depth=8, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=1,
+            objective='multi:softprob', num_class=4,
+            random_state=RANDOM_STATE, n_jobs=-1,
+            eval_metric='mlogloss'
+        ),
+        'XGB_shallow': xgb.XGBClassifier(
+            n_estimators=1000, max_depth=4, learning_rate=0.01,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            objective='multi:softprob', num_class=4,
+            random_state=RANDOM_STATE, n_jobs=-1,
+            eval_metric='mlogloss'
+        ),
+        'XGB_lr01': xgb.XGBClassifier(
+            n_estimators=1000, max_depth=6, learning_rate=0.01,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            objective='multi:softprob', num_class=4,
+            random_state=RANDOM_STATE, n_jobs=-1,
+            eval_metric='mlogloss'
+        ),
     }
 
 
 # ============================================================================
-# TF WRAPPER FOR GEE DEPLOYMENT
+# 10-FOLD CV RUNNER
 # ============================================================================
 
-def export_rf_as_savedmodel(model, features, scaler_mean, scaler_scale, export_dir):
-    """
-    Wrap a scikit-learn RF in a TensorFlow SavedModel for the GEE pipeline.
-    The model expects normalized inputs (same as MLP pipeline).
-    """
-    import tensorflow as tf
+def run_10fold_cv(X, y, model, model_name, n_folds=N_FOLDS):
+    """Run stratified K-fold CV, return mean and std Kappa."""
+    kappa_scorer = make_scorer(cohen_kappa_score)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
 
-    n_features = len(features)
-    n_classes = len(CLASS_NAMES)
+    # For XGBoost, we need sample_weight via fit_params
+    is_xgb = 'XGB' in model_name
 
-    # Get RF predictions as a numpy function
-    # We need to "bake" the model into a TF graph via tf.py_function or
-    # by converting the RF to a lookup
+    if is_xgb:
+        # Manual CV loop for XGBoost with sample weights
+        fold_kappas = []
+        for train_idx, val_idx in skf.split(X, y):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
 
-    # Approach: extract all trees and build a TF voting model
-    # Simpler approach: use a tf.function with numpy interop
+            y_train_num = np.array([LABEL_MAP[s] for s in y_train])
+            y_val_num = np.array([LABEL_MAP[s] for s in y_val])
 
-    # Actually simplest: create a Keras model that replicates RF predictions
-    # by storing the RF predict_proba output for the training data range
+            sw = compute_sample_weight('balanced', y_train_num)
+            model_clone = xgb.XGBClassifier(**model.get_params())
+            model_clone.fit(X_train, y_train_num, sample_weight=sw)
 
-    # MOST PRACTICAL: create a TF SavedModel that wraps the sklearn predict
-    # This works because the Colab notebook calls serve_fn() in Python anyway
+            y_pred_num = model_clone.predict(X_val)
+            y_pred_str = np.array([INV_LABEL_MAP[p] for p in y_pred_num])
 
-    class RFModule(tf.Module):
-        def __init__(self, rf_model, feature_names):
-            super().__init__()
-            self.rf_model = rf_model
-            self.feature_names = feature_names
-            self.class_names = CLASS_NAMES
+            k = cohen_kappa_score(y_val, y_pred_str)
+            fold_kappas.append(k)
 
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[None, n_features], dtype=tf.float32, name='covariate_input')
-        ])
-        def __call__(self, covariate_input):
-            # This will be traced but the actual prediction happens via py_function
-            result = tf.py_function(
-                func=self._predict,
-                inp=[covariate_input],
-                Tout=tf.float32
-            )
-            result.set_shape([None, n_classes])
-            return result
-
-        def _predict(self, inputs):
-            """Run RF prediction on numpy data."""
-            x_np = inputs.numpy()
-            proba = self.rf_model.predict_proba(x_np).astype(np.float32)
-            return tf.constant(proba)
-
-    module = RFModule(model, features)
-
-    # Test
-    test_input = tf.constant(np.random.randn(2, n_features).astype(np.float32))
-    test_output = module(test_input)
-    print(f"TF wrapper test: input {test_input.shape} → output {test_output.shape}")
-
-    # Save
-    os.makedirs(export_dir, exist_ok=True)
-    export_path = os.path.join(export_dir, 'rf_burn_severity')
-
-    tf.saved_model.save(
-        module,
-        export_path,
-        signatures={
-            'serving_default': module.__call__.get_concrete_function(
-                tf.TensorSpec(shape=[None, n_features], dtype=tf.float32, name='covariate_input')
-            )
-        }
-    )
-    print(f"SavedModel exported to: {export_path}")
-    return export_path
-
-
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
-def plot_comparison(results_list, save_dir):
-    """Compare all experiments."""
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Kappa comparison
-    fig, ax = plt.subplots(figsize=(10, 6))
-    labels = [r['label'] for r in results_list]
-    kappas = [r['kappa'] for r in results_list]
-    colors = ['#e74c3c' if k < 0.5 else '#f39c12' if k < 0.65 else '#2ecc71' for k in kappas]
-
-    bars = ax.bar(labels, kappas, color=colors, edgecolor='black', linewidth=1.5)
-    ax.axhline(y=0.65, color='green', linestyle='--', linewidth=2, label='Target: 0.65')
-    for bar, k in zip(bars, kappas):
-        ax.annotate(f'{k:.4f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                    xytext=(0, 3), textcoords="offset points", ha='center', fontweight='bold')
-
-    ax.set_ylabel("Cohen's Kappa", fontsize=12)
-    ax.set_title("RF Tuning — Kappa Comparison", fontsize=14, fontweight='bold')
-    ax.legend()
-    ax.set_ylim(0, max(kappas) * 1.25)
-    plt.xticks(rotation=15, ha='right')
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/rf_tuning_kappa_comparison.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {save_dir}/rf_tuning_kappa_comparison.png")
-
-    # Confusion matrices for all experiments
-    n = len(results_list)
-    fig, axes = plt.subplots(1, n, figsize=(7*n, 6))
-    if n == 1:
-        axes = [axes]
-
-    for ax, r in zip(axes, results_list):
-        cm = r['cm']
-        cm_pct = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-        annot = np.empty_like(cm, dtype=object)
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                annot[i, j] = f'{cm[i, j]}\n({cm_pct[i, j]:.1f}%)'
-
-        sns.heatmap(cm, annot=annot, fmt='', cmap='Blues',
-                    xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
-        ax.set_title(f'{r["label"]}\nKappa: {r["kappa"]:.4f}', fontweight='bold')
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('True')
-
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/rf_tuning_confusion_matrices.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {save_dir}/rf_tuning_confusion_matrices.png")
+        return np.array(fold_kappas)
+    else:
+        scores = cross_val_score(model, X, y, cv=skf, scoring=kappa_scorer, n_jobs=-1)
+        return scores
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
+INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
+
 def main():
-    print("=" * 80)
-    print("RF BURN SEVERITY — HYPERPARAMETER TUNING")
-    print("=" * 80)
+    print("=" * 70)
+    print("10-FOLD STRATIFIED CV — MODEL SEARCH")
+    print("=" * 70)
 
-    df = load_data()
-    all_features = get_all_numeric_features(df)
-    print(f"\nAll numeric features available: {len(all_features)}")
-    print(f"Top 30 features: {len(TOP_30_FEATURES)}")
+    # Load data
+    datasets = load_data()
 
-    results_list = []
+    # Determine feature sets from largest dataset
+    print("\n" + "=" * 70)
+    print("DETERMINING FEATURE SETS")
+    print("=" * 70)
+    df_largest = datasets['OldUp']
+    top50 = get_top_n_features(df_largest, 50)
+    top75 = get_top_n_features(df_largest, 75)
+    all_feats = get_all_features(df_largest)
+    print(f"  Top 30: {len(TOP_30_FEATURES)}")
+    print(f"  Top 50: {len(top50)}")
+    print(f"  Top 75: {len(top75)}")
+    print(f"  All:    {len(all_feats)}")
 
-    # ------------------------------------------------------------------
-    # Experiment 1: Baseline (top 30, current params)
-    # ------------------------------------------------------------------
-    r1 = run_experiment(df, TOP_30_FEATURES, "Top30 Baseline")
-    results_list.append(r1)
+    feature_sets = {
+        'Top30': TOP_30_FEATURES,
+        'Top50': top50,
+        'Top75': top75,
+        'All': all_feats,
+    }
 
-    # ------------------------------------------------------------------
-    # Experiment 2: All features, default params
-    # ------------------------------------------------------------------
-    r2 = run_experiment(df, all_features, "All Features")
-    results_list.append(r2)
+    models = get_models()
 
-#     # ------------------------------------------------------------------
-#     # Experiment 3: Top 30 + GridSearch
-#     # ------------------------------------------------------------------
-#     param_grid_30 = {
-#         'n_estimators': [300, 500, 800],
-#         'max_depth': [15, 25, None],
-#         'min_samples_split': [2, 5, 10],
-#         'min_samples_leaf': [1, 2, 4],
-#         'class_weight': ['balanced', 'balanced_subsample'],
-#     }
-#     r3 = run_experiment(df, TOP_30_FEATURES, "Top30 GridSearch", param_grid=param_grid_30)
-#     results_list.append(r3)
+    # Run all combos
+    print("\n" + "=" * 70)
+    print(f"RUNNING {len(models)} MODELS × {len(feature_sets)} FEATURE SETS × {len(datasets)} DATASETS")
+    print(f"= {len(models) * len(feature_sets) * len(datasets)} experiments, {N_FOLDS}-fold CV each")
+    print("=" * 70)
 
-#     # ------------------------------------------------------------------
-#     # Experiment 4: All features + GridSearch
-#     # ------------------------------------------------------------------
-#     param_grid_all = {
-#         'n_estimators': [300, 500, 800],
-#         'max_depth': [15, 25, None],
-#         'min_samples_split': [2, 5, 10],
-#         'min_samples_leaf': [1, 2, 4],
-#         'class_weight': ['balanced', 'balanced_subsample'],
-#     }
-#     r4 = run_experiment(df, all_features, "AllFeat GridSearch", param_grid=param_grid_all)
-#     results_list.append(r4)
+    results = []
+    total = len(models) * len(feature_sets) * len(datasets)
+    count = 0
 
-#     # ------------------------------------------------------------------
-#     # Find best
-#     # ------------------------------------------------------------------
-#     best = max(results_list, key=lambda r: r['kappa'])
-#     print("\n" + "=" * 60)
-#     print(f"BEST MODEL: {best['label']}")
-#     print(f"Kappa: {best['kappa']:.4f}")
-#     if best['best_params']:
-#         print(f"Params: {best['best_params']}")
-#     print(f"Features: {len(best['features'])}")
-#     print("=" * 60)
+    for ds_name, df in datasets.items():
+        for fs_name, fs in feature_sets.items():
+            X, y, available = prepare_xy(df, fs)
 
-#     # ------------------------------------------------------------------
-#     # Visualizations
-#     # ------------------------------------------------------------------
-#     os.makedirs(OUTPUT_DIR, exist_ok=True)
-#     plot_comparison(results_list, OUTPUT_DIR)
+            for model_name, model in models.items():
+                count += 1
+                label = f"{model_name} | {ds_name} | {fs_name}"
 
-#     # ------------------------------------------------------------------
-#     # Save best RF model
-#     # ------------------------------------------------------------------
-#     model_path = os.path.join(OUTPUT_DIR, 'best_rf_model.joblib')
-#     joblib.dump(best['model'], model_path)
-#     print(f"\nBest RF saved: {model_path}")
+                try:
+                    fold_scores = run_10fold_cv(X, y, model, model_name)
+                    mean_k = fold_scores.mean()
+                    std_k = fold_scores.std()
 
-#     # ------------------------------------------------------------------
-#     # Export as TF SavedModel for GEE pipeline
-#     # ------------------------------------------------------------------
-#     print("\n" + "=" * 60)
-#     print("EXPORTING AS TENSORFLOW SAVEDMODEL")
-#     print("=" * 60)
+                    results.append({
+                        'label': label,
+                        'model': model_name,
+                        'dataset': ds_name,
+                        'features': fs_name,
+                        'n_features': len(available),
+                        'n_samples': len(y),
+                        'mean_kappa': mean_k,
+                        'std_kappa': std_k,
+                        'min_kappa': fold_scores.min(),
+                        'max_kappa': fold_scores.max(),
+                        'fold_scores': fold_scores.tolist(),
+                    })
 
-#     # Compute scaler params (for the Colab notebook)
-#     X_all = df[best['features']].fillna(df[best['features']].median()).values.astype(np.float32)
-#     X_all = np.where(np.isnan(X_all) | np.isinf(X_all), 0.0, X_all)
-#     scaler = StandardScaler()
-#     scaler.fit(X_all)
+                    marker = " ★" if mean_k >= 0.65 else " ✓" if mean_k >= 0.60 else ""
+                    print(f"  [{count:3d}/{total}] {label:55s}  Kappa: {mean_k:.4f} ± {std_k:.4f}{marker}")
 
-#     os.makedirs(GEE_EXPORT_DIR, exist_ok=True)
-#     export_path = export_rf_as_savedmodel(
-#         best['model'], best['features'],
-#         scaler.mean_, scaler.scale_,
-#         GEE_EXPORT_DIR
-#     )
+                except Exception as e:
+                    print(f"  [{count:3d}/{total}] {label:55s}  ERROR: {e}")
+                    results.append({
+                        'label': label,
+                        'model': model_name,
+                        'dataset': ds_name,
+                        'features': fs_name,
+                        'n_features': len(available),
+                        'n_samples': len(y),
+                        'mean_kappa': 0.0,
+                        'std_kappa': 0.0,
+                        'min_kappa': 0.0,
+                        'max_kappa': 0.0,
+                        'fold_scores': [],
+                    })
 
-#     # Save metadata
-#     metadata = {
-#         'model_type': 'RandomForest_TF_Wrapped',
-#         'feature_names': best['features'],
-#         'n_features': len(best['features']),
-#         'class_names': CLASS_NAMES,
-#         'input_shape': [len(best['features'])],
-#         'output_shape': [4],
-#         'scaler_mean': scaler.mean_.tolist(),
-#         'scaler_scale': scaler.scale_.tolist(),
-#         'training_info': {
-#             'test_kappa': float(best['kappa']),
-#             'test_accuracy': float(best['accuracy']),
-#             'best_params': best['best_params'],
-#             'n_features': len(best['features']),
-#             'experiment': best['label'],
-#         },
-#         'export_date': datetime.now().isoformat(),
-#     }
+    # Sort results
+    results_df = pd.DataFrame(results).sort_values('mean_kappa', ascending=False)
 
-#     meta_path = os.path.join(GEE_EXPORT_DIR, 'model_metadata.json')
-#     with open(meta_path, 'w') as f:
-#         json.dump(metadata, f, indent=2)
-#     print(f"Metadata: {meta_path}")
+    # Print ranked table
+    print("\n" + "=" * 110)
+    print(f"{'Rank':>4} {'Model':<20} {'Data':<8} {'Feats':<8} {'Mean κ':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'N':>6}")
+    print("=" * 110)
+    for i, (_, row) in enumerate(results_df.head(30).iterrows()):
+        marker = " ★" if row['mean_kappa'] >= 0.65 else " ✓" if row['mean_kappa'] >= 0.60 else ""
+        print(f"{i+1:>4} {row['model']:<20} {row['dataset']:<8} {row['features']:<8} "
+              f"{row['mean_kappa']:>8.4f} {row['std_kappa']:>8.4f} {row['min_kappa']:>8.4f} "
+              f"{row['max_kappa']:>8.4f} {row['n_samples']:>6}{marker}")
+    print("=" * 110)
 
-#     scaler_path = os.path.join(GEE_EXPORT_DIR, 'scaler.pkl')
-#     with open(scaler_path, 'wb') as f:
-#         pickle.dump(scaler, f)
-#     print(f"Scaler: {scaler_path}")
+    # Save full results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    results_df.to_csv(f'{OUTPUT_DIR}/10fold_cv_all_results.csv', index=False)
+    print(f"\nFull results saved: {OUTPUT_DIR}/10fold_cv_all_results.csv")
 
-#     # ------------------------------------------------------------------
-#     # Summary
-#     # ------------------------------------------------------------------
-#     print("\n" + "=" * 60)
-#     print("DONE — NEXT STEPS")
-#     print("=" * 60)
-#     print(f"""
-# Best model: {best['label']} (Kappa: {best['kappa']:.4f})
+    # Plot top 20
+    top20 = results_df.head(20)
+    fig, ax = plt.subplots(figsize=(14, 8))
+    colors = ['#e74c3c' if k < 0.55 else '#f39c12' if k < 0.60 else '#2ecc71' if k < 0.65 else '#27ae60'
+              for k in top20['mean_kappa']]
 
-# To deploy to GEE:
-#   1. Upload {GEE_EXPORT_DIR}/rf_burn_severity/ to
-#      gs://ee2-sanjana-wildfire-ml/models/rf_burn_severity/
+    y_pos = range(len(top20))
+    bars = ax.barh(y_pos, top20['mean_kappa'].values, xerr=top20['std_kappa'].values,
+                   color=colors, edgecolor='black', linewidth=0.5, capsize=3)
+    ax.axvline(x=0.65, color='green', linestyle='--', linewidth=2, label='Target: 0.65')
+    ax.axvline(x=0.60, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='0.60')
 
-#   2. Update the Colab notebook:
-#      - MODEL_PATH = 'gs://ee2-sanjana-wildfire-ml/models/rf_burn_severity'
-#      - Update SCALER_MEAN and SCALER_SCALE from {meta_path}
-#      - Update FEATURE_NAMES if using all features
-#      - Update N_FEATURES
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(top20['label'].values, fontsize=7)
+    ax.set_xlabel("Cohen's Kappa (10-fold CV)", fontsize=12)
+    ax.set_title("Top 20 Model Configurations — 10-Fold Stratified CV",
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}/top20_10fold_cv.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {OUTPUT_DIR}/top20_10fold_cv.png")
 
-#   3. If using all features, also update the GEE export script
-#      to export all covariates (not just 30)
+    # Print best config details
+    best = results_df.iloc[0]
+    print(f"\n{'★'*60}")
+    print(f"  BEST CONFIG:")
+    print(f"  Model:    {best['model']}")
+    print(f"  Dataset:  {best['dataset']}")
+    print(f"  Features: {best['features']} ({best['n_features']})")
+    print(f"  10-fold Kappa: {best['mean_kappa']:.4f} ± {best['std_kappa']:.4f}")
+    print(f"{'★'*60}")
+    print(f"\nUse this config in your LOFO CV + final training script.")
 
-#   4. Re-run the Colab notebook
-# """)
-
-#     return results_list, best
-    return results_list, None
+    return results_df
 
 
 if __name__ == '__main__':
-    results_list, best = main()
+    results_df = main()
