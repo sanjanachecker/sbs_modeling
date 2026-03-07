@@ -6,7 +6,11 @@ Tests combinations of:
   Features: Top 30, Top 50, Top 75, All
   Data: No upsampling, Old upsampled (moderate-matched)
 
-Outputs a ranked table of all combos by mean Kappa.
+Outputs a ranked table of all combos by a composite score:
+  70% mean Cohen's Kappa
+  30% mean recall for the "high" class
+
+Also reports mean Kappa and mean high recall separately.
 Use the best combo in a separate LOFO + training script.
 """
 
@@ -17,8 +21,8 @@ from sklearn.ensemble import (
     RandomForestClassifier, GradientBoostingClassifier,
     ExtraTreesClassifier
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.metrics import make_scorer, cohen_kappa_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import cohen_kappa_score, recall_score
 from sklearn.utils.class_weight import compute_sample_weight
 import xgboost as xgb
 import matplotlib.pyplot as plt
@@ -38,6 +42,7 @@ N_FOLDS = 10
 
 CLASS_NAMES = ['unburned', 'low', 'moderate', 'high']
 LABEL_MAP = {'unburned': 0, 'low': 1, 'moderate': 2, 'high': 3}
+INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
 
 TOP_30_FEATURES = [
     'dnbr', 'dndvi', 'dndbi', 'dbsi', 'nbr', 'bsi', 'ndvi', 'ndbi',
@@ -52,6 +57,10 @@ EXCLUDE_COLS = {
     'PointX', 'PointY', '.geo', 'system:index', 'label',
     'latitude', 'longitude', 'lat', 'lon', 'x', 'y'
 }
+
+# Composite ranking weights
+KAPPA_WEIGHT = 0.7
+HIGH_RECALL_WEIGHT = 0.3
 
 
 # ============================================================================
@@ -196,44 +205,56 @@ def get_models():
 # ============================================================================
 
 def run_10fold_cv(X, y, model, model_name, n_folds=N_FOLDS):
-    """Run stratified K-fold CV, return mean and std Kappa."""
-    kappa_scorer = make_scorer(cohen_kappa_score)
+    """
+    Run stratified K-fold CV.
+    Return dict with per-fold Kappa and per-fold recall for the 'high' class.
+    """
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
 
-    # For XGBoost, we need sample_weight via fit_params
+    fold_kappas = []
+    fold_high_recalls = []
+
     is_xgb = 'XGB' in model_name
 
-    if is_xgb:
-        # Manual CV loop for XGBoost with sample weights
-        fold_kappas = []
-        for train_idx, val_idx in skf.split(X, y):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+    for train_idx, val_idx in skf.split(X, y):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
 
+        if is_xgb:
             y_train_num = np.array([LABEL_MAP[s] for s in y_train])
-            y_val_num = np.array([LABEL_MAP[s] for s in y_val])
-
             sw = compute_sample_weight('balanced', y_train_num)
+
             model_clone = xgb.XGBClassifier(**model.get_params())
             model_clone.fit(X_train, y_train_num, sample_weight=sw)
 
             y_pred_num = model_clone.predict(X_val)
-            y_pred_str = np.array([INV_LABEL_MAP[p] for p in y_pred_num])
+            y_pred = np.array([INV_LABEL_MAP[p] for p in y_pred_num])
+        else:
+            model_clone = model.__class__(**model.get_params())
+            model_clone.fit(X_train, y_train)
+            y_pred = model_clone.predict(X_val)
 
-            k = cohen_kappa_score(y_val, y_pred_str)
-            fold_kappas.append(k)
+        kappa = cohen_kappa_score(y_val, y_pred)
+        high_recall = recall_score(
+            y_val,
+            y_pred,
+            labels=CLASS_NAMES,
+            average=None,
+            zero_division=0
+        )[CLASS_NAMES.index('high')]
 
-        return np.array(fold_kappas)
-    else:
-        scores = cross_val_score(model, X, y, cv=skf, scoring=kappa_scorer, n_jobs=-1)
-        return scores
+        fold_kappas.append(kappa)
+        fold_high_recalls.append(high_recall)
+
+    return {
+        'kappa_scores': np.array(fold_kappas),
+        'high_recall_scores': np.array(fold_high_recalls),
+    }
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
-
-INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
 
 def main():
     print("=" * 70)
@@ -284,9 +305,20 @@ def main():
                 label = f"{model_name} | {ds_name} | {fs_name}"
 
                 try:
-                    fold_scores = run_10fold_cv(X, y, model, model_name)
-                    mean_k = fold_scores.mean()
-                    std_k = fold_scores.std()
+                    cv_metrics = run_10fold_cv(X, y, model, model_name)
+
+                    kappa_scores = cv_metrics['kappa_scores']
+                    high_recall_scores = cv_metrics['high_recall_scores']
+
+                    mean_k = kappa_scores.mean()
+                    std_k = kappa_scores.std()
+                    mean_high_recall = high_recall_scores.mean()
+                    std_high_recall = high_recall_scores.std()
+
+                    combined_score = (
+                        KAPPA_WEIGHT * mean_k +
+                        HIGH_RECALL_WEIGHT * mean_high_recall
+                    )
 
                     results.append({
                         'label': label,
@@ -297,13 +329,22 @@ def main():
                         'n_samples': len(y),
                         'mean_kappa': mean_k,
                         'std_kappa': std_k,
-                        'min_kappa': fold_scores.min(),
-                        'max_kappa': fold_scores.max(),
-                        'fold_scores': fold_scores.tolist(),
+                        'min_kappa': kappa_scores.min(),
+                        'max_kappa': kappa_scores.max(),
+                        'mean_high_recall': mean_high_recall,
+                        'std_high_recall': std_high_recall,
+                        'combined_score': combined_score,
+                        'kappa_scores': kappa_scores.tolist(),
+                        'high_recall_scores': high_recall_scores.tolist(),
                     })
 
-                    marker = " ★" if mean_k >= 0.65 else " ✓" if mean_k >= 0.60 else ""
-                    print(f"  [{count:3d}/{total}] {label:55s}  Kappa: {mean_k:.4f} ± {std_k:.4f}{marker}")
+                    marker = " ★" if combined_score >= 0.60 else " ✓" if combined_score >= 0.55 else ""
+                    print(
+                        f"  [{count:3d}/{total}] {label:55s}  "
+                        f"Kappa: {mean_k:.4f} ± {std_k:.4f}  "
+                        f"High R: {mean_high_recall:.4f}  "
+                        f"Combo: {combined_score:.4f}{marker}"
+                    )
 
                 except Exception as e:
                     print(f"  [{count:3d}/{total}] {label:55s}  ERROR: {e}")
@@ -318,44 +359,65 @@ def main():
                         'std_kappa': 0.0,
                         'min_kappa': 0.0,
                         'max_kappa': 0.0,
-                        'fold_scores': [],
+                        'mean_high_recall': 0.0,
+                        'std_high_recall': 0.0,
+                        'combined_score': 0.0,
+                        'kappa_scores': [],
+                        'high_recall_scores': [],
                     })
 
     # Sort results
-    results_df = pd.DataFrame(results).sort_values('mean_kappa', ascending=False)
+    results_df = pd.DataFrame(results).sort_values(
+        ['combined_score', 'mean_kappa', 'mean_high_recall'],
+        ascending=False
+    )
 
     # Print ranked table
-    print("\n" + "=" * 110)
-    print(f"{'Rank':>4} {'Model':<20} {'Data':<8} {'Feats':<8} {'Mean κ':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'N':>6}")
-    print("=" * 110)
+    print("\n" + "=" * 135)
+    print(f"{'Rank':>4} {'Model':<20} {'Data':<8} {'Feats':<8} {'Mean κ':>8} {'High R':>8} {'Combo':>8} {'Std κ':>8} {'Min':>8} {'Max':>8} {'N':>6}")
+    print("=" * 135)
     for i, (_, row) in enumerate(results_df.head(30).iterrows()):
-        marker = " ★" if row['mean_kappa'] >= 0.65 else " ✓" if row['mean_kappa'] >= 0.60 else ""
+        marker = " ★" if row['combined_score'] >= 0.60 else " ✓" if row['combined_score'] >= 0.55 else ""
         print(f"{i+1:>4} {row['model']:<20} {row['dataset']:<8} {row['features']:<8} "
-              f"{row['mean_kappa']:>8.4f} {row['std_kappa']:>8.4f} {row['min_kappa']:>8.4f} "
-              f"{row['max_kappa']:>8.4f} {row['n_samples']:>6}{marker}")
-    print("=" * 110)
+              f"{row['mean_kappa']:>8.4f} {row['mean_high_recall']:>8.4f} {row['combined_score']:>8.4f} "
+              f"{row['std_kappa']:>8.4f} {row['min_kappa']:>8.4f} {row['max_kappa']:>8.4f} "
+              f"{row['n_samples']:>6}{marker}")
+    print("=" * 135)
 
     # Save full results
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     results_df.to_csv(f'{OUTPUT_DIR}/10fold_cv_all_results.csv', index=False)
     print(f"\nFull results saved: {OUTPUT_DIR}/10fold_cv_all_results.csv")
 
-    # Plot top 20
+    # Also save ranking by high recall only
+    results_df.sort_values('mean_high_recall', ascending=False).to_csv(
+        f'{OUTPUT_DIR}/10fold_cv_sorted_by_high_recall.csv',
+        index=False
+    )
+    print(f"High-recall ranking saved: {OUTPUT_DIR}/10fold_cv_sorted_by_high_recall.csv")
+
+    # Plot top 20 by composite score
     top20 = results_df.head(20)
     fig, ax = plt.subplots(figsize=(14, 8))
-    colors = ['#e74c3c' if k < 0.55 else '#f39c12' if k < 0.60 else '#2ecc71' if k < 0.65 else '#27ae60'
-              for k in top20['mean_kappa']]
+    colors = ['#e74c3c' if s < 0.50 else '#f39c12' if s < 0.55 else '#2ecc71' if s < 0.60 else '#27ae60'
+              for s in top20['combined_score']]
 
     y_pos = range(len(top20))
-    bars = ax.barh(y_pos, top20['mean_kappa'].values, xerr=top20['std_kappa'].values,
-                   color=colors, edgecolor='black', linewidth=0.5, capsize=3)
-    ax.axvline(x=0.65, color='green', linestyle='--', linewidth=2, label='Target: 0.65')
-    ax.axvline(x=0.60, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='0.60')
+    ax.barh(
+        y_pos,
+        top20['combined_score'].values,
+        color=colors,
+        edgecolor='black',
+        linewidth=0.5
+    )
 
-    ax.set_yticks(y_pos)
+    ax.axvline(x=0.60, color='green', linestyle='--', linewidth=2, label='Strong composite')
+    ax.axvline(x=0.55, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='Moderate composite')
+
+    ax.set_yticks(list(y_pos))
     ax.set_yticklabels(top20['label'].values, fontsize=7)
-    ax.set_xlabel("Cohen's Kappa (10-fold CV)", fontsize=12)
-    ax.set_title("Top 20 Model Configurations — 10-Fold Stratified CV",
+    ax.set_xlabel("Composite Score = 0.7 × Kappa + 0.3 × High Recall", fontsize=12)
+    ax.set_title("Top 20 Model Configurations — Ranked by Kappa + High Recall",
                  fontsize=14, fontweight='bold')
     ax.legend(loc='lower right')
     ax.invert_yaxis()
@@ -371,7 +433,9 @@ def main():
     print(f"  Model:    {best['model']}")
     print(f"  Dataset:  {best['dataset']}")
     print(f"  Features: {best['features']} ({best['n_features']})")
-    print(f"  10-fold Kappa: {best['mean_kappa']:.4f} ± {best['std_kappa']:.4f}")
+    print(f"  10-fold Kappa:      {best['mean_kappa']:.4f} ± {best['std_kappa']:.4f}")
+    print(f"  Mean high recall:   {best['mean_high_recall']:.4f} ± {best['std_high_recall']:.4f}")
+    print(f"  Composite score:    {best['combined_score']:.4f}")
     print(f"{'★'*60}")
     print(f"\nUse this config in your LOFO CV + final training script.")
 
