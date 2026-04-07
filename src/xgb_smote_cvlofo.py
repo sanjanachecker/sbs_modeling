@@ -28,6 +28,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 import xgboost as xgb
 import matplotlib.pyplot as plt
 import seaborn as sns
+from imblearn.over_sampling import SMOTE, BorderlineSMOTE
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -62,7 +63,7 @@ XGB_PARAMS = {
     'eval_metric': 'mlogloss',
 }
 
-# Top 30 features
+# Top 30 features — hardcoded from tuning script (same as model search)
 TOP_30_FEATURES = [
     'dnbr', 'dndvi', 'dndbi', 'dbsi', 'nbr', 'bsi', 'ndvi', 'ndbi',
     'meanelev_32', 'wc_bio19', 'nirBand', 'wc_bio05', 'rdgh_6', 'blueBand',
@@ -76,6 +77,23 @@ EXCLUDE_COLS = {
     'PointX', 'PointY', '.geo', 'system:index', 'label',
     'latitude', 'longitude', 'lat', 'lon', 'x', 'y'
 }
+
+# ============================================================================
+# SMOTE CONFIGURATION
+# ============================================================================
+# Applied inside the LOFO loop (on training folds only) to avoid data leakage.
+# Also applied before final model training on all data.
+#
+# SMOTE_STRATEGY: target count for the 'high' class after resampling.
+#   - Current high count: ~402 (after combining main + upsampled CSVs)
+#   - Set to 700-800 to boost without over-generating
+#   - Try 'borderline' if regular SMOTE doesn't improve high recall
+#
+# Set SMOTE_STRATEGY to None to disable SMOTE entirely (baseline comparison).
+
+SMOTE_TYPE = 'smote'          # 'smote' or 'borderline'
+SMOTE_TARGET_HIGH = 700       # synthetic high samples to reach this count
+SMOTE_K_NEIGHBORS = 5         # k neighbors for interpolation (default 5)
 
 
 # ============================================================================
@@ -129,6 +147,50 @@ def prepare_xy(df, features):
     return X, y, available
 
 
+def apply_smote(X_train, y_train, smote_type=SMOTE_TYPE,
+                target_high=SMOTE_TARGET_HIGH, k_neighbors=SMOTE_K_NEIGHBORS):
+    """
+    Apply SMOTE to the training fold only — never to test data.
+    Only oversamples the 'high' class (label=3) to avoid distorting other classes.
+    Returns resampled X_train, y_train and sample weights.
+    """
+    if target_high is None:
+        return X_train, y_train, compute_sample_weight('balanced', y_train)
+
+    current_high = (y_train == 3).sum()
+    if current_high == 0:
+        # No high samples in this fold's training set — skip SMOTE
+        return X_train, y_train, compute_sample_weight('balanced', y_train)
+
+    # Only oversample high if we'd actually be increasing it
+    if current_high >= target_high:
+        return X_train, y_train, compute_sample_weight('balanced', y_train)
+
+    # k_neighbors can't exceed the number of high samples minus 1
+    k = min(k_neighbors, current_high - 1)
+    if k < 1:
+        return X_train, y_train, compute_sample_weight('balanced', y_train)
+
+    sampling_strategy = {3: target_high}  # only resample class 3 (high)
+
+    if smote_type == 'borderline':
+        sampler = BorderlineSMOTE(
+            sampling_strategy=sampling_strategy,
+            k_neighbors=k,
+            random_state=RANDOM_STATE
+        )
+    else:
+        sampler = SMOTE(
+            sampling_strategy=sampling_strategy,
+            k_neighbors=k,
+            random_state=RANDOM_STATE
+        )
+
+    X_res, y_res = sampler.fit_resample(X_train, y_train)
+    sample_weights = compute_sample_weight('balanced', y_res)
+    return X_res, y_res, sample_weights
+
+
 # ============================================================================
 # LEAVE-ONE-FIRE-OUT CROSS-VALIDATION
 # ============================================================================
@@ -172,7 +234,8 @@ def leave_one_fire_out_cv(df, fire_col, features):
         X_train, X_test = X_all[train_mask], X_all[test_mask]
         y_train, y_test = y_all[train_mask], y_all[test_mask]
 
-        sample_weights = compute_sample_weight('balanced', y_train)
+        # Apply SMOTE to training fold only — never touches test data
+        X_train, y_train, sample_weights = apply_smote(X_train, y_train)
 
         model = xgb.XGBClassifier(**XGB_PARAMS)
         model.fit(X_train, y_train, sample_weight=sample_weights)
@@ -286,7 +349,9 @@ def train_final_model(df, features):
     print("=" * 70)
 
     X, y, available = prepare_xy(df, features)
-    sample_weights = compute_sample_weight('balanced', y)
+
+    # Apply SMOTE to full training set before final model fit
+    X, y, sample_weights = apply_smote(X, y)
 
     model = xgb.XGBClassifier(**XGB_PARAMS)
     model.fit(X, y, sample_weight=sample_weights)
@@ -515,6 +580,7 @@ def main():
     print("=" * 70)
     print(f"XGB params: {XGB_PARAMS}")
     print(f"Features: Top30 ({len(TOP_30_FEATURES)} features)")
+    print(f"SMOTE: type={SMOTE_TYPE}, target_high={SMOTE_TARGET_HIGH}, k={SMOTE_K_NEIGHBORS}")
 
     # Load data
     df, fire_col = load_data()

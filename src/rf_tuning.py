@@ -29,10 +29,6 @@ import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
-# ============================================================================
-# CONFIGURATION — UPDATE PATHS
-# ============================================================================
-
 MAIN_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_complete_covariates_fixed_1229.csv'
 OLD_UPSAMPLED_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_upsampled_points_with_covariates_fixed.csv'
 OUTPUT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results_model_search'

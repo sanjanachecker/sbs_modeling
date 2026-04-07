@@ -1,19 +1,14 @@
 """
-ExtraTrees Burn Severity — Train on All Fires + LOFO CV + GEE Export
-=====================================================================
-Best config from model search (10-fold CV Kappa = 0.6118, Test Kappa = 0.6053):
+XGBoost Burn Severity — Train on All Fires + Fire-Level LOO CV
+================================================================
+Best config from tuning: XGB OldUp + Top50
+  - n_estimators=500, max_depth=6, learning_rate=0.05
+  - subsample=0.8, colsample_bytree=0.8, min_child_weight=3
+  - balanced sample weights
+  - Top 50 features (RF importance ranked)
 
-  ExtraTreesClassifier(
-      n_estimators=500, max_depth=None, min_samples_split=2,
-      min_samples_leaf=1, class_weight='balanced'
-  )
-  Features: Top 50 (RF importance ranked)
-  Data: Old upsampled (moderate-matched, 3204 samples)
-
-Pipeline:
-  1. LOFO CV for honest evaluation
-  2. Train final model on ALL data
-  3. Export as TF SavedModel for GEE prediction pipeline
+Evaluation: Leave-One-Fire-Out cross-validation
+Final model: Trained on ALL fires, exported as TF SavedModel for GEE
 """
 
 import pandas as pd
@@ -25,10 +20,12 @@ import joblib
 from datetime import datetime
 from sklearn.metrics import (
     cohen_kappa_score, classification_report, confusion_matrix,
-    accuracy_score, precision_recall_fscore_support
+    accuracy_score
 )
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_sample_weight
+import xgboost as xgb
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
@@ -38,17 +35,35 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # ============================================================================
 
-MAIN_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_complete_covariates_fixed_1229.csv'
-OLD_UPSAMPLED_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_upsampled_points_with_covariates_fixed.csv'
+# MAIN_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_complete_covariates_fixed_1229.csv'
+# OLD_UPSAMPLED_CSV = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/data/real_all_fires_upsampled_points_with_covariates_fixed.csv'
 
-OUTPUT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results_et_final'
-GEE_EXPORT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/gee_models_et_final'
+MAIN_CSV = '/Users/sanjanachecker/Downloads/spring_fire_covariates_orig.csv'
+OLD_UPSAMPLED_CSV = '/Users/sanjanachecker/Downloads/spring_covariates_upsampled.csv'
+
+OUTPUT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/results_xgb_final'
+GEE_EXPORT_DIR = '/Users/sanjanachecker/csc/masters/sbs/sbs_modeling/gee_models_xgb_final'
 
 RANDOM_STATE = 42
 
 CLASS_NAMES = ['unburned', 'low', 'moderate', 'high']
-STAGE1_CLASS_NAMES = ['unburned', 'low', 'burned_strong']
-STAGE2_CLASS_NAMES = ['moderate', 'high']
+LABEL_MAP = {'unburned': 0, 'low': 1, 'moderate': 2, 'high': 3}
+INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
+
+# Best XGBoost hyperparameters from tuning
+XGB_PARAMS = {
+    'n_estimators': 500,
+    'max_depth': 6,
+    'learning_rate': 0.05,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'min_child_weight': 3,
+    'objective': 'multi:softprob',
+    'num_class': 4,
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'eval_metric': 'mlogloss',
+}
 
 EXCLUDE_COLS = {
     'SBS', 'Fire_year', 'fire', 'source', 'data_source', 'Source',
@@ -74,37 +89,11 @@ def load_data():
     df_up = pd.read_csv(OLD_UPSAMPLED_CSV)
     print(f"Upsampled CSV: {len(df_up)} rows")
 
+    # Combine on common columns
     common_cols = list(set(df_main.columns) & set(df_up.columns))
     df = pd.concat([df_main[common_cols], df_up[common_cols]], ignore_index=True)
     df['SBS'] = df['SBS'].replace({'mod': 'moderate'})
     df = df[df['SBS'].isin(CLASS_NAMES)].copy()
-    # ------------------------------------------------------------------
-    # Feature engineering: rdNBR
-    # rdNBR = dNBR / sqrt(|pre-fire NBR|)
-    # Here we use existing 'nbr' as the denominator proxy already in the data.
-    # Small epsilon prevents divide-by-zero / unstable values.
-    # ------------------------------------------------------------------
-    if 'dnbr' in df.columns and 'nbr' in df.columns:
-        df['rdnbr'] = df['dnbr'] / np.sqrt(np.abs(df['nbr']) + 1e-6)
-        df['rdnbr'] = df['rdnbr'].replace([np.inf, -np.inf], np.nan)
-
-        # ------------------------------------------------------------------
-    # Feature engineering: interaction features
-    # These help the model separate moderate vs high severity
-    # by combining burn change with vegetation / SWIR response.
-    # ------------------------------------------------------------------
-    interaction_specs = [
-        ('dnbr', 'ndvi', 'dnbr_x_ndvi'),
-        ('dnbr', 'swir2Band', 'dnbr_x_swir2'),
-        ('dnbr', 'swir1Band', 'dnbr_x_swir1'),
-        ('dndvi', 'swir2Band', 'dndvi_x_swir2'),
-        ('rdnbr', 'swir2Band', 'rdnbr_x_swir2'),
-    ]
-
-    for a, b, new_col in interaction_specs:
-        if a in df.columns and b in df.columns:
-            df[new_col] = df[a] * df[b]
-            df[new_col] = df[new_col].replace([np.inf, -np.inf], np.nan)
 
     print(f"Combined: {len(df)} rows")
     print(f"\nClass distribution:")
@@ -112,15 +101,17 @@ def load_data():
         count = (df['SBS'] == cls).sum()
         print(f"  {cls:12s}: {count:5d} ({count/len(df)*100:.1f}%)")
 
+    # Identify fire column
     fire_col = 'Fire_year' if 'Fire_year' in df.columns else 'fire'
-    print(f"\nFires: {df[fire_col].nunique()}")
+    fires = df[fire_col].unique()
+    print(f"\nFires: {len(fires)}")
     print(f"Fire column: {fire_col}")
 
     return df, fire_col
 
 
 def get_top50_features(df):
-    """Get top 50 features using a preliminary RF."""
+    """Get top 50 features using a preliminary RF (same as tuning script)."""
     print("\n" + "=" * 70)
     print("DETERMINING TOP 50 FEATURES")
     print("=" * 70)
@@ -144,133 +135,21 @@ def get_top50_features(df):
     top50 = [available[i] for i in indices]
 
     print(f"Top 50 features determined")
-    print(f"Top 50: {top50}")
+    print(f"Top 5: {top50[:5]}")
     return top50
 
-
-def prepare_xy(df, features):
-    """Extract X, y arrays."""
-    available = [f for f in features if f in df.columns]
-    X = df[available].fillna(df[available].median()).values.astype(np.float32)
-    X = np.where(np.isnan(X) | np.isinf(X), 0.0, X)
-    y = df['SBS'].values
-    return X, y, available
-
-def make_stage1_labels(y):
-    """Map 4-class labels into stage-1 3-class labels."""
-    y_stage1 = np.array(y, dtype=object).copy()
-    y_stage1[np.isin(y_stage1, ['moderate', 'high'])] = 'burned_strong'
-    return y_stage1
-
-def predict_two_stage(stage1_model, stage2_model, X):
-    """
-    Return:
-      y_pred_final: final 4-class predictions
-      final_proba:  Nx4 probabilities in CLASS_NAMES order
-    """
-    n = X.shape[0]
-
-    # ------------------------------------------------------------
-    # Stage 1 probabilities: ['burned_strong', 'low', 'unburned'] or similar
-    # Reorder into STAGE1_CLASS_NAMES = ['unburned', 'low', 'burned_strong']
-    # ------------------------------------------------------------
-    s1_raw = stage1_model.predict_proba(X)
-    s1_classes = list(stage1_model.classes_)
-    s1_reorder = [s1_classes.index(c) for c in STAGE1_CLASS_NAMES]
-    s1_proba = s1_raw[:, s1_reorder]
-
-    # Default final probability matrix: [unburned, low, moderate, high]
-    final_proba = np.zeros((n, 4), dtype=np.float32)
-
-    # Put stage-1 unburned and low directly
-    final_proba[:, 0] = s1_proba[:, STAGE1_CLASS_NAMES.index('unburned')]
-    final_proba[:, 1] = s1_proba[:, STAGE1_CLASS_NAMES.index('low')]
-
-    burned_idx = STAGE1_CLASS_NAMES.index('burned_strong')
-    burned_mask = s1_proba[:, burned_idx] > 0
-
-    # ------------------------------------------------------------
-    # Stage 2 probabilities only for burned_strong branch
-    # Reorder into STAGE2_CLASS_NAMES = ['moderate', 'high']
-    # Then multiply by P(burned_strong)
-    # ------------------------------------------------------------
-    if burned_mask.any():
-        X_burned = X[burned_mask]
-        s2_raw = stage2_model.predict_proba(X_burned)
-        s2_classes = list(stage2_model.classes_)
-        s2_reorder = [s2_classes.index(c) for c in STAGE2_CLASS_NAMES]
-        s2_proba = s2_raw[:, s2_reorder]
-
-        p_burned = s1_proba[burned_mask, burned_idx]
-        final_proba[burned_mask, 2] = p_burned * s2_proba[:, STAGE2_CLASS_NAMES.index('moderate')]
-        final_proba[burned_mask, 3] = p_burned * s2_proba[:, STAGE2_CLASS_NAMES.index('high')]
-
-    # Numerical safety
-    row_sums = final_proba.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1.0
-    final_proba = final_proba / row_sums
-
-    y_pred_final = np.array(CLASS_NAMES)[np.argmax(final_proba, axis=1)]
-    return y_pred_final, final_proba
-
-# def create_model():
-#     """Create the best ExtraTrees model with boosted high class weight."""
-#     # 'balanced' weights based on class counts (3204 total):
-#     #   unburned (1110): ~0.72
-#     #   low (665):       ~1.20
-#     #   moderate (1027): ~0.78
-#     #   high (402):      ~1.99
-#     #
-#     # We further boost high to 3.0 to fix the high→moderate misclassification
-#     return ExtraTreesClassifier(
-#         n_estimators=500,
-#         max_depth=None,
-#         min_samples_split=2,
-#         min_samples_leaf=1,
-#         class_weight={
-#             'unburned': 0.72,
-#             'low': 1.20,
-#             'moderate': 0.78,
-#             'high': 2,
-#         },
-#         random_state=RANDOM_STATE,
-#         n_jobs=-1
-#     )
-
-def create_stage1_model():
-    """Stage 1: unburned vs low vs burned_strong."""
-    return ExtraTreesClassifier(
-        n_estimators=500,
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        class_weight='balanced',
-        random_state=RANDOM_STATE,
-        n_jobs=-1
-    )
-
-
-def create_stage2_model():
-    return ExtraTreesClassifier(
-        n_estimators=500,
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        class_weight={
-            'moderate': 1.0,
-            'high': 2.5
-        },
-        random_state=RANDOM_STATE,
-        n_jobs=-1
-    )
 
 # ============================================================================
 # LEAVE-ONE-FIRE-OUT CROSS-VALIDATION
 # ============================================================================
 
 def leave_one_fire_out_cv(df, fire_col, features):
-    """LOFO CV with ExtraTrees."""
-    MIN_SAMPLES = 5
+    """
+    Leave-One-Fire-Out CV:
+    For each fire with enough samples, train on all other fires, predict on the held-out fire.
+    Small fires (< MIN_SAMPLES) are still used for TRAINING but not as held-out test fires.
+    """
+    MIN_SAMPLES = 1  # Minimum samples to use a fire as a held-out test fold
 
     print("\n" + "=" * 70)
     print("LEAVE-ONE-FIRE-OUT CROSS-VALIDATION")
@@ -279,19 +158,21 @@ def leave_one_fire_out_cv(df, fire_col, features):
     available = [f for f in features if f in df.columns]
     X_all = df[available].fillna(df[available].median()).values.astype(np.float32)
     X_all = np.where(np.isnan(X_all) | np.isinf(X_all), 0.0, X_all)
-    y_all = df['SBS'].values
+    y_all_str = df['SBS'].values
+    y_all = np.array([LABEL_MAP[s] for s in y_all_str])
     fires_all = df[fire_col].values
 
     unique_fires = sorted(df[fire_col].unique())
-    fire_counts = df[fire_col].value_counts()
-    eval_fires = [f for f in unique_fires if fire_counts.get(f, 0) >= MIN_SAMPLES]
-    small_fires = [f for f in unique_fires if fire_counts.get(f, 0) < MIN_SAMPLES]
-
     print(f"Total fires: {len(unique_fires)}")
     print(f"Features: {len(available)}")
     print(f"Total samples: {len(y_all)}")
-    print(f"Fires evaluated (>= {MIN_SAMPLES} samples): {len(eval_fires)}")
-    print(f"Fires training-only (< {MIN_SAMPLES} samples): {len(small_fires)}")
+
+    # Count samples per fire and identify which are large enough for evaluation
+    fire_counts = df[fire_col].value_counts()
+    eval_fires = [f for f in unique_fires if fire_counts.get(f, 0) >= MIN_SAMPLES]
+    small_fires = [f for f in unique_fires if fire_counts.get(f, 0) < MIN_SAMPLES]
+    print(f"Fires with >= {MIN_SAMPLES} samples (used for evaluation): {len(eval_fires)}")
+    print(f"Fires with < {MIN_SAMPLES} samples (training only): {len(small_fires)}")
 
     all_y_true = []
     all_y_pred = []
@@ -304,33 +185,17 @@ def leave_one_fire_out_cv(df, fire_col, features):
         X_train, X_test = X_all[train_mask], X_all[test_mask]
         y_train, y_test = y_all[train_mask], y_all[test_mask]
 
-        # -----------------------------
-        # Stage 1: unburned / low / burned_strong
-        # -----------------------------
-        y_train_stage1 = make_stage1_labels(y_train)
+        # Balanced sample weights
+        sample_weights = compute_sample_weight('balanced', y_train)
 
-        stage1_model = create_stage1_model()
-        stage1_model.fit(X_train, y_train_stage1)
+        # Train XGBoost
+        model = xgb.XGBClassifier(**XGB_PARAMS)
+        model.fit(X_train, y_train, sample_weight=sample_weights)
 
-        # -----------------------------
-        # Stage 2: moderate / high only
-        # -----------------------------
-        mh_mask_train = np.isin(y_train, ['moderate', 'high'])
-        X_train_stage2 = X_train[mh_mask_train]
-        y_train_stage2 = y_train[mh_mask_train]
+        # Predict
+        y_pred = model.predict(X_test)
 
-        stage2_model = create_stage2_model()
-        stage2_model.fit(X_train_stage2, y_train_stage2)
-
-        # -----------------------------
-        # Two-stage prediction
-        # -----------------------------
-                # -----------------------------
-        # Two-stage prediction
-        # -----------------------------
-        y_pred, final_proba = predict_two_stage(stage1_model, stage2_model, X_test)
-        
-
+        # Metrics for this fire
         if len(np.unique(y_test)) >= 2:
             kappa = cohen_kappa_score(y_test, y_pred)
         else:
@@ -351,15 +216,18 @@ def leave_one_fire_out_cv(df, fire_col, features):
         status = f"Kappa: {kappa:.4f}" if not np.isnan(kappa) else "Kappa: N/A (1 class)"
         print(f"  [{i+1}/{len(eval_fires)}] {held_out_fire:30s} {status}  Acc: {acc:.4f}  (n={len(y_test)})")
 
+    # Overall metrics
     all_y_true = np.array(all_y_true)
     all_y_pred = np.array(all_y_pred)
 
     overall_kappa = cohen_kappa_score(all_y_true, all_y_pred)
     overall_acc = accuracy_score(all_y_true, all_y_pred)
-    cm = confusion_matrix(all_y_true, all_y_pred, labels=CLASS_NAMES)
-    precision, recall, f1, support = precision_recall_fscore_support(
-        all_y_true, all_y_pred, labels=CLASS_NAMES, zero_division=0
-    )
+
+    # Convert to string labels for classification report
+    y_true_str = np.array([INV_LABEL_MAP[y] for y in all_y_true])
+    y_pred_str = np.array([INV_LABEL_MAP[y] for y in all_y_pred])
+
+    cm = confusion_matrix(y_true_str, y_pred_str, labels=CLASS_NAMES)
 
     fire_df = pd.DataFrame(fire_results)
     valid_kappas = fire_df['kappa'].dropna()
@@ -367,7 +235,9 @@ def leave_one_fire_out_cv(df, fire_col, features):
     print("\n" + "=" * 70)
     print("LOFO CV RESULTS")
     print("=" * 70)
-    print(f"\nFires evaluated: {len(fire_df)} / {len(unique_fires)} total")
+    print(f"\nMinimum samples threshold: {MIN_SAMPLES}")
+    print(f"Fires evaluated: {len(fire_df)} / {len(unique_fires)} total")
+    print(f"Fires excluded (< {MIN_SAMPLES} samples, used for training only): {len(small_fires)}")
     print(f"Samples evaluated: {len(all_y_true)} / {len(y_all)} total")
     print(f"\nOverall Cohen's Kappa:  {overall_kappa:.4f}")
     print(f"Overall Accuracy:       {overall_acc:.4f}")
@@ -378,20 +248,13 @@ def leave_one_fire_out_cv(df, fire_col, features):
     print(f"  Min:    {valid_kappas.min():.4f} ({fire_df.loc[valid_kappas.idxmin(), 'fire']})")
     print(f"  Max:    {valid_kappas.max():.4f} ({fire_df.loc[valid_kappas.idxmax(), 'fire']})")
     print(f"\nClassification Report:")
-    print(classification_report(
-    all_y_true,
-    all_y_pred,
-    labels=CLASS_NAMES,
-    target_names=CLASS_NAMES))
+    print(classification_report(y_true_str, y_pred_str, target_names=CLASS_NAMES))
 
-    print(f"Per-class metrics:")
-    for j, cls in enumerate(CLASS_NAMES):
-        print(f"  {cls:12s}  P: {precision[j]:.3f}  R: {recall[j]:.3f}  F1: {f1[j]:.3f}  (n={support[j]})")
-
+    # Moderate row
     mod_idx = CLASS_NAMES.index('moderate')
     mod_row = cm[mod_idx]
     mod_total = mod_row.sum()
-    print(f"\nModerate row breakdown:")
+    print(f"Moderate row breakdown:")
     for j, cls in enumerate(CLASS_NAMES):
         print(f"  → {cls:12s}: {mod_row[j]:4d} ({mod_row[j]/mod_total*100:.1f}%)")
 
@@ -399,12 +262,9 @@ def leave_one_fire_out_cv(df, fire_col, features):
         'overall_kappa': overall_kappa,
         'overall_accuracy': overall_acc,
         'fire_results': fire_df,
-        'y_true': all_y_true,
-        'y_pred': all_y_pred,
+        'y_true': y_true_str,
+        'y_pred': y_pred_str,
         'cm': cm,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
     }
 
 
@@ -413,86 +273,59 @@ def leave_one_fire_out_cv(df, fire_col, features):
 # ============================================================================
 
 def train_final_model(df, features):
-    """Train 2-stage ExtraTrees on ALL data for deployment."""
+    """Train XGBoost on ALL data for deployment."""
     print("\n" + "=" * 70)
-    print("TRAINING FINAL 2-STAGE MODEL ON ALL DATA")
+    print("TRAINING FINAL MODEL ON ALL DATA")
     print("=" * 70)
 
-    X, y, available = prepare_xy(df, features)
+    available = [f for f in features if f in df.columns]
 
-    # -----------------------------
-    # Stage 1
-    # -----------------------------
-    y_stage1 = make_stage1_labels(y)
-    stage1_model = create_stage1_model()
-    stage1_model.fit(X, y_stage1)
+    X = df[available].fillna(df[available].median()).values.astype(np.float32)
+    X = np.where(np.isnan(X) | np.isinf(X), 0.0, X)
+    y = np.array([LABEL_MAP[s] for s in df['SBS'].values])
 
-    # -----------------------------
-    # Stage 2
-    # -----------------------------
-    mh_mask = np.isin(y, ['moderate', 'high'])
-    X_stage2 = X[mh_mask]
-    y_stage2 = y[mh_mask]
+    sample_weights = compute_sample_weight('balanced', y)
 
-    stage2_model = create_stage2_model()
-    stage2_model.fit(X_stage2, y_stage2)
+    model = xgb.XGBClassifier(**XGB_PARAMS)
+    model.fit(X, y, sample_weight=sample_weights)
 
     print(f"Trained on {len(y)} samples, {len(available)} features")
-    for cls in CLASS_NAMES:
-        count = (y == cls).sum()
-        print(f"  {cls:12s}: {count}")
+    print(f"Class distribution: { {INV_LABEL_MAP[c]: int((y==c).sum()) for c in range(4)} }")
 
+    # Scaler for normalization in prediction pipeline
     scaler = StandardScaler()
     scaler.fit(X)
 
-    return {
-        'stage1_model': stage1_model,
-        'stage2_model': stage2_model,
-        'scaler': scaler,
-        'features': available
-    }
+    return model, scaler, available
+
 
 # ============================================================================
 # EXPORT
 # ============================================================================
 
-def export_model(final_bundle, cv_results, save_dir):
-    """Export 2-stage model as joblib + TF SavedModel + metadata."""
+def export_model(model, scaler, features, cv_results, save_dir):
+    """Export as joblib + TF SavedModel + metadata."""
     import tensorflow as tf
 
     os.makedirs(save_dir, exist_ok=True)
-
-    stage1_model = final_bundle['stage1_model']
-    stage2_model = final_bundle['stage2_model']
-    scaler = final_bundle['scaler']
-    features = final_bundle['features']
     n_features = len(features)
 
-    # ------------------------------------------------------------
-    # Save sklearn models
-    # ------------------------------------------------------------
-    joblib.dump(stage1_model, f'{save_dir}/et_stage1.joblib')
-    joblib.dump(stage2_model, f'{save_dir}/et_stage2.joblib')
-    print(f"Stage 1 model saved: {save_dir}/et_stage1.joblib")
-    print(f"Stage 2 model saved: {save_dir}/et_stage2.joblib")
+    # Save XGBoost model
+    joblib.dump(model, f'{save_dir}/xgb_burn_severity.joblib')
+    print(f"XGBoost model saved: {save_dir}/xgb_burn_severity.joblib")
 
-    # Reorder helpers
-    s1_model_classes = list(stage1_model.classes_)
-    s1_reorder = [s1_model_classes.index(c) for c in STAGE1_CLASS_NAMES]
+    # TF wrapper
+    # XGBoost classes_ are [0, 1, 2, 3] matching LABEL_MAP order
+    # which matches CLASS_NAMES = [unburned, low, moderate, high]
+    model_classes = list(model.classes_)
+    reorder_idx = list(range(4))  # Already in correct order for numeric labels
+    print(f"Model classes: {model_classes}")
 
-    s2_model_classes = list(stage2_model.classes_)
-    s2_reorder = [s2_model_classes.index(c) for c in STAGE2_CLASS_NAMES]
-
-    print(f"Stage 1 classes: {s1_model_classes}")
-    print(f"Stage 2 classes: {s2_model_classes}")
-
-    class TwoStageETModule(tf.Module):
-        def __init__(self, stage1_model, stage2_model, s1_reorder, s2_reorder):
+    class XGBModule(tf.Module):
+        def __init__(self, xgb_model, reorder):
             super().__init__()
-            self.stage1_model = stage1_model
-            self.stage2_model = stage2_model
-            self.s1_reorder = s1_reorder
-            self.s2_reorder = s2_reorder
+            self.xgb_model = xgb_model
+            self.reorder = reorder
 
         @tf.function(input_signature=[
             tf.TensorSpec(shape=[None, n_features], dtype=tf.float32, name='covariate_input')
@@ -503,43 +336,19 @@ def export_model(final_bundle, cv_results, save_dir):
             return result
 
         def _predict(self, inputs):
-            X = inputs.numpy()
+            proba = self.xgb_model.predict_proba(inputs.numpy()).astype(np.float32)
+            proba = proba[:, self.reorder]
+            return tf.constant(proba)
 
-            # Stage 1
-            s1_raw = self.stage1_model.predict_proba(X).astype(np.float32)
-            s1_proba = s1_raw[:, self.s1_reorder]  # ['unburned', 'low', 'burned_strong']
+    module = XGBModule(model, reorder_idx)
 
-            n = X.shape[0]
-            out = np.zeros((n, 4), dtype=np.float32)
-
-            out[:, 0] = s1_proba[:, STAGE1_CLASS_NAMES.index('unburned')]
-            out[:, 1] = s1_proba[:, STAGE1_CLASS_NAMES.index('low')]
-
-            burned_idx = STAGE1_CLASS_NAMES.index('burned_strong')
-            burned_mask = s1_proba[:, burned_idx] > 0
-
-            if burned_mask.any():
-                X_burned = X[burned_mask]
-                s2_raw = self.stage2_model.predict_proba(X_burned).astype(np.float32)
-                s2_proba = s2_raw[:, self.s2_reorder]  # ['moderate', 'high']
-
-                p_burned = s1_proba[burned_mask, burned_idx]
-                out[burned_mask, 2] = p_burned * s2_proba[:, STAGE2_CLASS_NAMES.index('moderate')]
-                out[burned_mask, 3] = p_burned * s2_proba[:, STAGE2_CLASS_NAMES.index('high')]
-
-            row_sums = out.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1.0
-            out = out / row_sums
-            return tf.constant(out, dtype=tf.float32)
-
-    module = TwoStageETModule(stage1_model, stage2_model, s1_reorder, s2_reorder)
-
+    # Test
     test_input = tf.constant(np.random.randn(2, n_features).astype(np.float32))
     test_out = module(test_input)
     print(f"TF wrapper test: (2, {n_features}) → {test_out.shape}")
-    print(f"Row sums (should be ~1.0): {test_out.numpy().sum(axis=1)}")
+    print(f"Row sums: {test_out.numpy().sum(axis=1)}")
 
-    export_path = f'{save_dir}/et_burn_severity_savedmodel'
+    export_path = f'{save_dir}/xgb_burn_severity_savedmodel'
     tf.saved_model.save(
         module, export_path,
         signatures={
@@ -550,19 +359,16 @@ def export_model(final_bundle, cv_results, save_dir):
     )
     print(f"SavedModel: {export_path}")
 
+    # Metadata
     metadata = {
-        'model_type': 'ExtraTreesClassifier_TwoStage_TF_Wrapped',
+        'model_type': 'XGBClassifier_TF_Wrapped',
         'feature_names': features,
         'n_features': n_features,
         'class_names': CLASS_NAMES,
-        'stage1_class_names': STAGE1_CLASS_NAMES,
-        'stage2_class_names': STAGE2_CLASS_NAMES,
-        'stage1_model_class_order': s1_model_classes,
-        'stage2_model_class_order': s2_model_classes,
-        'stage1_reorder_indices': s1_reorder,
-        'stage2_reorder_indices': s2_reorder,
+        'label_map': LABEL_MAP,
         'scaler_mean': scaler.mean_.tolist(),
         'scaler_scale': scaler.scale_.tolist(),
+        'xgb_params': {k: str(v) for k, v in XGB_PARAMS.items()},
         'training_info': {
             'trained_on': 'all_fires',
             'lofo_cv_kappa': float(cv_results['overall_kappa']),
@@ -580,8 +386,9 @@ def export_model(final_bundle, cv_results, save_dir):
     with open(f'{save_dir}/scaler.pkl', 'wb') as f:
         pickle.dump(scaler, f)
 
-    print("Metadata + scaler saved")
+    print(f"Metadata + scaler saved")
     return export_path
+
 
 # ============================================================================
 # VISUALIZATION
@@ -603,7 +410,7 @@ def plot_results(cv_results, save_dir):
     ax.axvline(x=valid['kappa'].mean(), color='blue', linestyle='--', linewidth=1.5,
                label=f"Mean: {valid['kappa'].mean():.3f}")
     ax.set_xlabel("Cohen's Kappa", fontsize=12)
-    ax.set_title(f"LOFO CV — Per-Fire Kappa (ExtraTrees | Top50)\nOverall: {cv_results['overall_kappa']:.4f}",
+    ax.set_title(f"Leave-One-Fire-Out CV — Per-Fire Kappa\nOverall: {cv_results['overall_kappa']:.4f}",
                  fontsize=14, fontweight='bold')
     ax.legend(loc='lower right')
     plt.tight_layout()
@@ -624,7 +431,7 @@ def plot_results(cv_results, save_dir):
     sns.heatmap(cm, annot=annot, fmt='', cmap='Blues',
                 xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax,
                 cbar_kws={'label': 'Count'})
-    ax.set_title(f'ExtraTrees LOFO CV — Kappa: {cv_results["overall_kappa"]:.4f}',
+    ax.set_title(f'XGBoost LOFO CV — Kappa: {cv_results["overall_kappa"]:.4f}',
                  fontweight='bold', fontsize=14)
     ax.set_xlabel('Predicted', fontsize=12)
     ax.set_ylabel('True', fontsize=12)
@@ -633,7 +440,7 @@ def plot_results(cv_results, save_dir):
     plt.close()
     print(f"Saved: {save_dir}/lofo_confusion_matrix.png")
 
-    # 3. Kappa distribution
+    # 3. Kappa distribution histogram
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.hist(valid['kappa'], bins=15, color='#3498db', edgecolor='black', alpha=0.8)
     ax.axvline(x=valid['kappa'].mean(), color='red', linestyle='--', linewidth=2,
@@ -643,14 +450,14 @@ def plot_results(cv_results, save_dir):
     ax.axvline(x=0.65, color='green', linestyle='--', linewidth=2, label='Target: 0.65')
     ax.set_xlabel("Cohen's Kappa", fontsize=12)
     ax.set_ylabel("Number of Fires", fontsize=12)
-    ax.set_title("Distribution of Per-Fire Kappa Scores (ExtraTrees)", fontsize=14, fontweight='bold')
+    ax.set_title("Distribution of Per-Fire Kappa Scores", fontsize=14, fontweight='bold')
     ax.legend()
     plt.tight_layout()
     plt.savefig(f'{save_dir}/lofo_kappa_distribution.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved: {save_dir}/lofo_kappa_distribution.png")
 
-    # 4. Per-fire results CSV
+    # 4. Save per-fire results CSV
     fire_df.to_csv(f'{save_dir}/lofo_per_fire_results.csv', index=False)
     print(f"Saved: {save_dir}/lofo_per_fire_results.csv")
 
@@ -661,59 +468,58 @@ def plot_results(cv_results, save_dir):
 
 def main():
     print("=" * 70)
-    print("ExtraTrees BURN SEVERITY — ALL FIRES + LOFO CV")
+    print("XGBoost BURN SEVERITY — ALL FIRES + LOFO CV")
     print("=" * 70)
 
+    # Load data
     df, fire_col = load_data()
+
+    # Get top 50 features
     top50 = get_top50_features(df)
 
-    # LOFO CV
+    # Leave-One-Fire-Out CV
     cv_results = leave_one_fire_out_cv(df, fire_col, top50)
 
     # Plots
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     plot_results(cv_results, OUTPUT_DIR)
 
     # Train final model on ALL data
-    final_bundle = train_final_model(df, top50)
+    final_model, scaler, features = train_final_model(df, top50)
 
     # Export
-    export_path = export_model(final_bundle, cv_results, GEE_EXPORT_DIR)
+    os.makedirs(GEE_EXPORT_DIR, exist_ok=True)
+    export_path = export_model(final_model, scaler, features, cv_results, GEE_EXPORT_DIR)
 
     # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
     print(f"""
-Model: 2-Stage ExtraTrees
-  Stage 1: unburned / low / burned_strong
-  Stage 2: moderate / high
-Features: Top 50 (RF importance ranked)
-
 LOFO Cross-Validation:
-  Overall Kappa:       {cv_results['overall_kappa']:.4f}
-  Overall Accuracy:    {cv_results['overall_accuracy']:.4f}
+  Overall Kappa:      {cv_results['overall_kappa']:.4f}
+  Overall Accuracy:   {cv_results['overall_accuracy']:.4f}
   Mean per-fire Kappa: {cv_results['fire_results']['kappa'].dropna().mean():.4f}
-  Fires evaluated:     {len(cv_results['fire_results'])}
+  Fires evaluated:    {len(cv_results['fire_results'])}
 
 Final Model:
-  Trained on ALL {len(df)} samples
-  Features: {len(final_bundle['features'])}
+  Trained on ALL {len(df)} samples across all fires
+  Features: {len(features)}
   Exported to: {export_path}
 
 To deploy:
-  1. gsutil -m cp -r {GEE_EXPORT_DIR}/et_burn_severity_savedmodel \\
-       gs://ee2-sanjana-wildfire-ml/models/et_burn_severity_final/
+  1. gsutil -m cp -r {GEE_EXPORT_DIR}/xgb_burn_severity_savedmodel \\
+       gs://ee2-sanjana-wildfire-ml/models/xgb_burn_severity_final/
 
   2. Update Colab notebook:
-     - MODEL_PATH = 'gs://ee2-sanjana-wildfire-ml/models/et_burn_severity_final'
+     - MODEL_PATH = 'gs://ee2-sanjana-wildfire-ml/models/xgb_burn_severity_final'
      - Update SCALER_MEAN and SCALER_SCALE from {GEE_EXPORT_DIR}/model_metadata.json
-     - Update FEATURE_NAMES from model_metadata.json
 
-  3. Run GEE 50-feature export for all fires (if not done already)
+  3. Run GEE 50-feature export for all fires
   4. Run Colab notebook to generate maps
 """)
 
-    return cv_results, final_bundle
+    return cv_results, final_model
 
 
 if __name__ == '__main__':
