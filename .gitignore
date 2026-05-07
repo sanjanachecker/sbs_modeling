@@ -13,13 +13,21 @@ __pycache__/
 # Trained models and artifacts (large files, avoid pushing to GitHub)
 gee_models/
 gee_models_*/
+results*/
 results_rf_tuned/
 results_et_final/
 src/models/
 src/tuning_results/
 *.joblib
 *.pkl
+*.keras
+*.h5
 **/*_savedmodel/
 **/saved_model.pb
 **/fingerprint.pb
 **/variables/
+
+# Generated outputs
+*.png
+*.pdf
+cv_run_log.txt
